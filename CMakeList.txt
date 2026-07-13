@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.10)
+project(sandhook)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Main library
+add_library(sandhook SHARED src/sandhook_final_rwx.cpp)
+target_compile_options(sandhook PRIVATE -Wall -Wextra -O2)
+target_link_libraries(sandhook dl log)
+
+# Test (JNI test library)
+add_library(sandhook_test SHARED test/sandhook_jni_test.c)
+target_compile_options(sandhook_test PRIVATE -Wall -O2)
+target_link_libraries(sandhook_test dl log)
+
+# Examples
+add_executable(basic_hook examples/basic_hook.c)
+target_link_libraries(basic_hook dl)
+
+add_executable(libc_hook examples/libc_hook.c)
+target_link_libraries(libc_hook dl)
+
+add_library(jni_hook SHARED examples/jni_hook.cpp)
+target_link_libraries(jni_hook dl log)
