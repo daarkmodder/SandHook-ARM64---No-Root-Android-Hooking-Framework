@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Main library
-add_library(sandhook SHARED src/sandhook_final_rwx.cpp)
+add_library(sandhook SHARED src/sandhook_advanced.cpp)
 target_compile_options(sandhook PRIVATE -Wall -Wextra -O2)
 target_link_libraries(sandhook dl log)
 
