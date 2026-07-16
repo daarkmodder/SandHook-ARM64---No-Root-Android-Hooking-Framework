@@ -2,11 +2,12 @@
 // Public C API for SandHook ARM64 Native Engine
 // This header provides the interface to install, remove, and manage hooks
 // at the native memory level for Android ARM64.
+// Compatible with C and C++.
 
 #pragma once
 
-#include <cstdint>
-#include <cstddef>
+#include <stdint.h>
+#include <stddef.h>
 
 // Ensure C linkage so it can be used from C, C++, and JNI without name mangling
 #ifdef __cplusplus
@@ -16,7 +17,6 @@ extern "C" {
 // ============================================================================
 // ERROR CODES
 // ============================================================================
-// These codes are returned by the install/remove functions to indicate status.
 #define HOOK_OK                     0
 #define HOOK_NULL_ARGS              1
 #define HOOK_ALREADY_HOOKED         2
@@ -38,7 +38,7 @@ extern "C" {
  *
  * @param target       Pointer to the function to be hooked.
  * @param replacement  Pointer to the replacement function.
- * @param original_out Pointer to store the trampoline (call original). Can be nullptr.
+ * @param original_out Pointer to store the trampoline (call original). Can be NULL.
  * @return HOOK_OK on success, or an error code on failure.
  */
 int sandhook_install_ex(void* target, void* replacement, void** original_out);
@@ -48,20 +48,20 @@ int sandhook_install_ex(void* target, void* replacement, void** original_out);
  * 
  * @param target       Pointer to the function to be hooked.
  * @param replacement  Pointer to the replacement function.
- * @param original_out Pointer to store the trampoline. Can be nullptr.
- * @return The target pointer on success, or nullptr on failure.
+ * @param original_out Pointer to store the trampoline. Can be NULL.
+ * @return The target pointer on success, or NULL on failure.
  */
 void* sandhook_install(void* target, void* replacement, void** original_out);
 
 /**
  * Installs a single instruction hook (4 bytes patch).
  * Attempts a fast, atomic relative branch (B). 
- * Note: If a backup/trampoline is requested (original_out != nullptr) or the target 
+ * Note: If a backup/trampoline is requested (original_out != NULL) or the target 
  * is out of the 128MB relative range, it automatically falls back to the 20-byte standard hook.
  *
  * @param target       Pointer to the function to be hooked.
  * @param replacement  Pointer to the replacement function.
- * @param original_out Pointer to store the trampoline. (Recommended nullptr for pure single insn).
+ * @param original_out Pointer to store the trampoline. (Recommended NULL for pure single insn).
  * @return HOOK_OK on success, or an error code on failure.
  */
 int sandhook_install_single_insn(void* target, void* replacement, void** original_out);
@@ -78,7 +78,7 @@ int sandhook_remove(void* target);
  * Retrieves the trampoline pointer for a hooked function.
  *
  * @param target Pointer to the hooked function.
- * @return Pointer to the trampoline, or nullptr if not hooked.
+ * @return Pointer to the trampoline, or NULL if not hooked.
  */
 void* sandhook_trampoline(void* target);
 

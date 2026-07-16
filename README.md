@@ -2,7 +2,10 @@
 
 Un framework de hooking de métodos en línea (inline hooking) de nivel producción para Android ARM64. Funciona sin root y es compatible con Android 5.0 hasta Android 13+. 
 
-A diferencia de los motores de hooking básicos, SandHook no solo parchea código nativo (C/C++), sino que incluye una capa de abstracción ART que permite **hookear métodos Java/Kotlin** directamente, y una API de compatibilidad estilo Xposed.
+Este framework utiliza un motor nativo en C++ altamente optimizado capaz de bypassear las restricciones de seguridad más estrictas de Android moderno (SELinux `execmod`, W^X).
+
+> ⚠️ **Aviso de Compatibilidad:** 
+> Este framework está escrito y optimizado estrictamente para **C++**. Permite enlazar código C fácilmente, pero el núcleo requiere compilación con `clang++` y la librería estándar de C++. Existe la posibilidad de que en el futuro se porte a C puro, pero por ahora no está garantizado.
 
 **Versión:** 3.0 (Production)  
 **Arquitectura:** Android ARM64 (aarch64) únicamente  
@@ -12,110 +15,65 @@ A diferencia de los motores de hooking básicos, SandHook no solo parchea códig
 
 ## ✨ Características Principales
 
-- ✅ **Hook Nativo y Java/Kotlin:** Intercepta funciones C/C++ y métodos Java mediante la manipulación directa de `ArtMethod`.
+- ✅ **Hook Nativo:** Intercepta funciones C/C++ mediante parcheo de memoria directo y trampolines.
 - ✅ **Single Instruction Hook (Fast Hook):** Soporte para parchear atómicamente solo 4 bytes (1 instrucción) usando saltos relativos si el destino está en un rango de 128MB.
-- ✅ **Cumplimiento W^X (Android 10+):** Asignación de memoria en dos pasos (RW -> RX) para evitar violaciones de SELinux en Android modernos.
-- ✅ **Relocalización ARM64 Completa:** Analiza y reescribe instrucciones PC-relativas (ADRP, ADR, LDR_LIT, CBZ, TBZ) para garantizar trampolines seguros.
+- ✅ **Bypass Android 10/13 (`execmod`):** Implementa un fallback con `mmap` anónimo (`MAP_FIXED`) para bypassar las restricciones de SELinux que impiden ejecutar código modificado de librerías mapeadas.
+- ✅ **Cumplimiento W^X:** Asignación de memoria en dos pasos (RW para escritura, RX para ejecución) para evitar violaciones de SELinux.
+- ✅ **Relocalización ARM64 Completa:** Analiza y reescribe instrucciones PC-relativas (ADRP, ADR, LDR_LIT, CBZ, TBZ) garantizando trampolines seguros.
 - ✅ **Thread Safety (StopTheWorld):** Sincronización basada en `std::recursive_mutex` para evitar deadlocks al hookear funciones anidadas.
-- ✅ **Capa de Compatibilidad Xposed:** API en Java que imita a Xposed para fácil migración de módulos.
 
 ---
 
-## 🏗️ Arquitectura del Framework
-
-El proyecto se divide en 5 capas modularizadas para mantener la separación de responsabilidades:
-
-1. **`sandhook.cpp` (Motor Nativo):** Se encarga del ensamblador ARM64, gestión de memoria (`mmap`/`mprotect`), relocalización de instrucciones y trampolines.
-2. **`sandhook.h` (API C Pública):** El contrato que expone el motor nativo al resto del sistema.
-3. **`art_hook.cpp` (Capa ART):** Lee los offsets internos de Android para extraer direcciones de memoria nativas (`entry_point_from_quick_compiled_code`) de métodos Java.
-4. **`sandhook_jni.cpp` (Puente JNI):** Recibe llamadas desde Java, convierte objetos `Method` a direcciones `void*` y se las pasa al motor nativo.
-5. **`SandHook.java` (API Java):** Carga la librería y expone métodos estáticos fáciles de usar para desarrolladores Android.
-
----
-
-## 🛠️ Compilación e Integración
+## 🛠️ Compilación
 
 ### Requisitos
 - Android NDK r21 o superior.
-- Android Studio con soporte CMake.
+- `clang++` ARM64 cross-compiler.
 
-### Integración en Android Studio
+### Compilar el motor (Librería Estática)
 
-1. Coloca los archivos `CMakeLists.txt` y la carpeta `src/` (con los `.cpp` y `.h`) en tu módulo de app.
-2. Coloca los archivos `.java` en `app/src/main/java/com/swift/sandhook/`.
-3. Configura tu `build.gradle` (app-level):
+Para compilar el motor `sandhook.cpp` en una librería estática (`libsandhook.a`):
 
-```gradle
-android {
-    defaultConfig {
-        ndk {
-            abiFilters 'arm64-v8a' // SandHook solo soporta ARM64
-        }
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++14 -fno-exceptions -fno-rtti"
-            }
-        }
-    }
-    externalNativeBuild {
-        cmake {
-            path "src/main/cpp/CMakeLists.txt" // Ruta a tu CMakeLists
-        }
-    }
-}
+```bash
+# Compilar el motor a código objeto
+clang++ -c -fPIC -O2 \
+  -fno-exceptions -fno-rtti \
+  --target=aarch64-linux-android21 \
+  -I. -Isrc \
+  sandhook.cpp -o sandhook.o
+
+# Crear librería estática
+ar rcs libsandhook.a sandhook.o
 ```
+
+### Enlazar con tu proyecto (C / C++)
+
+Si tienes un proyecto en C o C++ y quieres usar SandHook, enlázalo así:
+
+```bash
+clang++ tu_codigo.cpp -o tu_libreria.so -shared -fPIC \
+  --target=aarch64-linux-android21 \
+  -I. -Isrc \
+  -O2 -fvisibility=hidden \
+  -fno-exceptions -fno-rtti \
+  -Wl,--strip-all \
+  -llog -landroid \
+  -static-libstdc++ \
+  ./libsandhook.a
+```
+
+*(Nota: Aunque tu código sea C puro (`.c`), usa `clang++` para el paso final de enlazado para que la STL de C++ se resuelva correctamente).*
 
 ---
 
-## 🚀 Uso (API Java / Kotlin)
+## 🚀 Uso (API Nativa C/C++)
 
-Para hookear un método Java o Kotlin desde tu aplicación:
+Para hookear una función nativa de una librería `.so` (ej. `libc.so`):
 
-```java
-import com.swift.sandhook.SandHook;
-import java.lang.reflect.Method;
-
-public class MyInjector {
-    
-    public static void applyHack() {
-        // 1. Inicializar el motor (calcula offsets de ART)
-        SandHook.init();
-
-        try {
-            // 2. Obtener referencias a los métodos
-            Method origin = TargetClass.class.getDeclaredMethod("getGold");
-            Method hook = MyInjector.class.getDeclaredMethod("hooked_getGold");
-            Method backup = MyInjector.class.getDeclaredMethod("backup_getGold");
-
-            // 3. Instalar el hook
-            boolean success = SandHook.hook(origin, hook, backup);
-            
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-    }
-
-    // Método de reemplazo
-    public static int hooked_getGold() {
-        return 9999; 
-    }
-
-    // Método backup (ejecutará el código original)
-    public static int backup_getGold() {
-        return 0;
-    }
-}
-```
-
----
-
-## ⚙️ Uso (API Nativa C/C++)
-
-Si quieres hookear una función nativa de una librería `.so` (ej. `libc.so`):
-
-```c
+```cpp
 #include "sandhook.h"
 #include <android/log.h>
+#include <dlfcn.h>
 
 typedef size_t (*strlen_fn)(const char*);
 
@@ -128,7 +86,7 @@ size_t hooked_strlen(const char* str) {
 }
 
 void init_native_hooks() {
-    // Instalar hook de 20 bytes (con trampolín)
+    // Instalar hook estándar (20 bytes, con trampolín)
     int err = sandhook_install_ex((void*)strlen, (void*)hooked_strlen, NULL);
     
     // O instalar un Single Instruction Hook (4 bytes, sin trampolín)
@@ -149,22 +107,24 @@ void init_native_hooks() {
 | `void* sandhook_trampoline(void* target)` | Obtiene el puntero al trampolín para ejecutar la función original. |
 | `const char* sandhook_error_string(int err)` | Convierte un código de error en texto legible. |
 
-### Códigos de Error
-- `0`: HOOK_OK (Éxito)
-- `1`: HOOK_NULL_ARGS (Argumentos nulos)
-- `2`: HOOK_ALREADY_HOOKED (Ya hookeado)
-- `3`: HOOK_RELOCATION_FAILED (Falló la relocalización ARM64)
-- `4`: HOOK_MPROTECT_FAILED (Falló el cambio de permisos de memoria)
-- `5`: HOOK_ALLOC_FAILED (Falló la asignación de memoria)
-- `9`: HOOK_OUT_OF_RANGE (Destino fuera de rango para Single Insn Hook)
-
 ---
 
 ## 🔒 Seguridad y Compatibilidad
 
-- **SELinux:** El motor respeta las políticas W^X. No utiliza `PROT_READ | PROT_WRITE | PROT_EXEC` simultáneamente en Android 10+, evitando cierres forzosos por SELinux.
+- **SELinux Bypass:** El motor detecta automáticamente cuando el sistema bloquea la ejecución de código modificado (`errno=13 EACCES`) y utiliza `mmap` con `MAP_FIXED` para reemplazar la página por una anónima, engañando al kernel y permitiendo la ejecución.
 - **Concurrencia:** El uso de `std::recursive_mutex` garantiza que no haya condiciones de carrera (race conditions) al instalar o remover hooks en funciones concurrentes.
 - **Limitaciones:** No se pueden hookear funciones cuya primera instrucción sea un salto incondicional (`B` o `BL`), ya que no se puede calcular un destino seguro para el trampolín.
+
+---
+
+## 👥 Créditos
+
+Desarrollado y mantenido por:
+
+- **GML-5.2** - Ingeniería inversa, arquitectura del núcleo y bypasses de seguridad.
+- **DᴀʀᴋMᴏᴅᴅᴇʀ** - Implementación nativa, relocalización ARM64 y pruebas de integración.
+
+Basado en los conceptos originales del ecosistema SandHook.
 
 ## Licencia
 Uso educativo y de investigación. Prohibida su distribución comercial sin autorización.

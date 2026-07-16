@@ -2,10 +2,8 @@
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
 // All critical bugs from fable-5 analysis FIXED (including ADR 21-bit immediate)
 // ADDED: Single Instruction Hook Support (Step 1)
-//
-// Build:
-// clang++ -c -fPIC -O2 -fno-exceptions -fno-rtti --target=aarch64-linux-android21 sandhook_production.cpp -o sandhook.o
-// ar rcs libsandhook.a sandhook.o
+// FIXED: W^X compliance for ExecMemGuard (RW allocation, RX lock after write)
+// FIXED: Android 10+ execmod bypass via MAP_FIXED anonymous mapping fallback
 
 #include <cstdint>
 #include <cstddef>
@@ -29,7 +27,6 @@
 #include <link.h>
 #include <elf.h>
 #include <android/log.h>
-// #include "src/obfuscate.h" // Descomenta cuando tengas obfuscate.h en tu proyecto
 
 #if !defined(__aarch64__)
 #error "This implementation is ARM64 (aarch64) only."
@@ -64,7 +61,7 @@ typedef std::uintptr_t Address;
 #define HOOK_INVALID_TARGET 6
 #define HOOK_BOUNDS_EXCEEDED 7
 #define HOOK_THREAD_SUSPENSION_FAILED 8
-#define HOOK_OUT_OF_RANGE 9 // Nuevo error para Single Insn Hook
+#define HOOK_OUT_OF_RANGE 9
 
 // ============================================================================
 // MEMORY UTILITIES
@@ -114,6 +111,7 @@ public:
     ExecMemGuard() = default;
     
     explicit ExecMemGuard(std::size_t size) : size_(size) {
+        // CORRECCIÓN W^X: Asignamos solo como Lectura y Escritura (RW)
         ptr_ = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (!ptr_ || ptr_ == MAP_FAILED) {
@@ -122,14 +120,6 @@ public:
             return;
         }
         LOGI("[mmap] Allocated %zu bytes at %p (RW)", size, ptr_);
-        
-        if (::mprotect(ptr_, size, PROT_READ | PROT_EXEC) != 0) {
-            LOGE("[mprotect] RX conversion FAILED: errno=%d", errno);
-            ::munmap(ptr_, size);
-            ptr_ = nullptr;
-            return;
-        }
-        LOGI("[mmap] Made executable (RX) at %p", ptr_);
     }
     
     ~ExecMemGuard() {
@@ -178,8 +168,38 @@ struct Mem {
         return page_protect(addr, len, PROT_READ | PROT_WRITE);
     }
 
+    // FIXED: Android 10+ execmod bypass
     static bool make_rx(void* addr, std::size_t len) {
-        return page_protect(addr, len, PROT_READ | PROT_EXEC);
+        // 1. Intentamos el método normal primero
+        if (page_protect(addr, len, PROT_READ | PROT_EXEC)) return true;
+        
+        // 2. BYPASS ANDROID 10+ (execmod):
+        // Si mprotect falla con EACCES, remapeamos la página como memoria anónima.
+        LOGW("[mprotect] R-X failed. Falling back to anonymous mapping (execmem bypass).");
+        
+        Address start = align_down(reinterpret_cast<Address>(addr));
+        Address end = align_up(reinterpret_cast<Address>(addr) + len);
+        std::size_t page_len = end - start;
+        
+        // Hacemos un backup de la memoria actual (que ya tiene nuestro patch inyectado)
+        std::vector<std::uint8_t> backup(page_len);
+        std::memcpy(backup.data(), reinterpret_cast<void*>(start), page_len);
+        
+        // Creamos una página anónima EXACTAMENTE en la misma dirección física (MAP_FIXED)
+        void* new_mem = ::mmap(reinterpret_cast<void*>(start), page_len, 
+                               PROT_READ | PROT_WRITE, 
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        
+        if (new_mem == MAP_FAILED) {
+            LOGE("[mmap] Anonymous fallback FAILED: errno=%d", errno);
+            return false;
+        }
+        
+        // Copiamos el contenido patcheado a la nueva página anónima
+        std::memcpy(new_mem, backup.data(), page_len);
+        
+        // Ahora sí, como es memoria anónima, el sistema nos permite hacerla Ejecutable
+        return page_protect(new_mem, page_len, PROT_READ | PROT_EXEC);
     }
 
     static void flush_caches(void* addr, std::size_t len) {
@@ -450,7 +470,7 @@ struct Hook {
     std::size_t tramp_size = 0;
     std::vector<std::uint8_t> backup;
     bool active = false;
-    bool is_single_insn = false; // Nuevo: Marca si es un hook de 1 sola instrucción
+    bool is_single_insn = false;
 };
 
 // ============================================================================
@@ -464,7 +484,6 @@ public:
         return hm;
     }
 
-    // Hook estándar (20 bytes)
     int install(void* target, void* replacement, void** original_out) {
         StopTheWorld stop;
         std::lock_guard<std::recursive_mutex> lk(mu_);
@@ -498,6 +517,17 @@ public:
         Mem::flush_caches(tramp, rel.tramp_size);
         Mem::flush_caches(target, h.patch_size);
 
+        // CORRECCIÓN W^X: Ahora que el trampolín está escrito y la caché limpia, 
+        // bloqueamos la memoria del trampolín como Solo Lectura y Ejecución (RX)
+        if (!Mem::make_rx(tramp, kTrampolineSize)) {
+            LOGE("Failed to make trampoline RX");
+            return HOOK_MPROTECT_FAILED;
+        }
+        LOGI("[mmap] Made trampoline executable (RX) at %p", tramp);
+
+        hex_dump("PATCHED TARGET", target, h.patch_size);
+        hex_dump("TRAMPOLINE", tramp, rel.tramp_size);
+
         if (!Mem::make_rx(target, h.patch_size)) {
             std::memcpy(target, h.backup.data(), h.backup.size());
             Mem::flush_caches(target, h.patch_size);
@@ -512,7 +542,6 @@ public:
         return HOOK_OK;
     }
 
-    // NUEVO: Single Instruction Hook (4 bytes)
     int install_single_insn(void* target, void* replacement, void** original_out) {
         StopTheWorld stop;
         std::lock_guard<std::recursive_mutex> lk(mu_);
@@ -520,8 +549,6 @@ public:
         if (!target || !replacement) return HOOK_NULL_ARGS;
         if (hooks_.count(target)) return HOOK_ALREADY_HOOKED;
 
-        // Si el usuario solicita un backup (original_out), un salto relativo de 4 bytes 
-        // no tiene espacio para generar un trampolín absoluto seguro. Caemos al método de 20 bytes.
         if (original_out != nullptr) {
             LOGW("[SingleInsn] Backup requested. Falling back to standard 20-byte hook.");
             return install(target, replacement, original_out);
@@ -529,22 +556,20 @@ public:
 
         std::int64_t offset = reinterpret_cast<std::int64_t>(replacement) - reinterpret_cast<std::int64_t>(target);
         
-        // Verificar si el destino está dentro del rango de un salto B (±128 MB)
         if (offset >= -(1LL << 27) && offset < (1LL << 27)) {
             
             Hook h;
             h.target = target;
             h.replacement = replacement;
-            h.patch_size = 4; // Solo 1 instrucción
+            h.patch_size = 4;
             h.is_single_insn = true;
             h.backup.resize(4);
             std::memcpy(h.backup.data(), target, 4);
 
             if (!Mem::make_rw(target, 4)) return HOOK_MPROTECT_FAILED;
 
-            // Construir salto relativo B
             std::uint32_t imm26 = (static_cast<std::uint32_t>(offset >> 2)) & 0x03FFFFFF;
-            std::uint32_t insn = 0x14000000 | imm26; // Opcode B + imm26
+            std::uint32_t insn = 0x14000000 | imm26;
             
             std::memcpy(target, &insn, 4);
             Mem::flush_caches(target, 4);
@@ -589,7 +614,6 @@ public:
             h.active = false;
         }
         
-        // Liberar trampolín solo si no es single_insn (que no asignó memoria extra)
         if (h.trampoline && !h.is_single_insn) {
             ::munmap(h.trampoline, kTrampolineSize);
         }
@@ -625,7 +649,6 @@ void* sandhook_install(void* target, void* replacement, void** original_out) {
     return (err == HOOK_OK) ? target : nullptr;
 }
 
-// NUEVA API EXPUESTA
 int sandhook_install_single_insn(void* target, void* replacement, void** original_out) {
     return HookManager::instance().install_single_insn(target, replacement, original_out);
 }
@@ -639,7 +662,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-3.0"; // Versión subida por nueva feature
+    return "sandhook-arm64-production-3.0";
 }
 
 const char* sandhook_error_string(int err) {
