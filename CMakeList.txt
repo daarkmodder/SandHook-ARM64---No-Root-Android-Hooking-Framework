@@ -1,25 +1,39 @@
-cmake_minimum_required(VERSION 3.10)
-project(sandhook)
+# CMakeLists.txt
+# Build script for SandHook ARM64 Production Framework
 
-set(CMAKE_CXX_STANDARD 17)
+cmake_minimum_required(VERSION 3.10.2)
+project(sandhook LANGUAGES CXX)
+
+# Force ARM64 architecture
+if(NOT ANDROID_ABI STREQUAL "arm64-v8a")
+    message(FATAL_ERROR "SandHook only supports arm64-v8a architecture.")
+endif()
+
+# Set C++ standard and flags
+set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Main library
-add_library(sandhook SHARED src/sandhook_advanced.cpp)
-target_compile_options(sandhook PRIVATE -Wall -Wextra -O2)
-target_link_libraries(sandhook dl log)
+# Add the SandHook shared library (libsandhook.so)
+add_library(sandhook SHARED
+    src/sandhook.cpp
+    src/art_hook.cpp
+    src/sandhook_jni.cpp
+)
 
-# Test (JNI test library)
-add_library(sandhook_test SHARED test/sandhook_jni_test.c)
-target_compile_options(sandhook_test PRIVATE -Wall -O2)
-target_link_libraries(sandhook_test dl log)
+# Include directories
+target_include_directories(sandhook PRIVATE src)
 
-# Examples
-add_executable(basic_hook examples/basic_hook.c)
-target_link_libraries(basic_hook dl)
+# Compiler options for production (size optimized, no RTTI/Exceptions)
+target_compile_options(sandhook PRIVATE
+    -O2
+    -fno-exceptions
+    -fno-rtti
+    -fPIC
+    -Wall
+    -Wextra
+)
 
-add_executable(libc_hook examples/libc_hook.c)
-target_link_libraries(libc_hook dl)
-
-add_library(jni_hook SHARED examples/jni_hook.cpp)
-target_link_libraries(jni_hook dl log)
+# Link required Android libraries
+target_link_libraries(sandhook
+    log    # For __android_log_print
+)

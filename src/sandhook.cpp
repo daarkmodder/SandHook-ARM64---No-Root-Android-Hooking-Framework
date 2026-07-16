@@ -1,6 +1,7 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
 // All critical bugs from fable-5 analysis FIXED (including ADR 21-bit immediate)
+// ADDED: Single Instruction Hook Support (Step 1)
 //
 // Build:
 // clang++ -c -fPIC -O2 -fno-exceptions -fno-rtti --target=aarch64-linux-android21 sandhook_production.cpp -o sandhook.o
@@ -28,6 +29,7 @@
 #include <link.h>
 #include <elf.h>
 #include <android/log.h>
+// #include "src/obfuscate.h" // Descomenta cuando tengas obfuscate.h en tu proyecto
 
 #if !defined(__aarch64__)
 #error "This implementation is ARM64 (aarch64) only."
@@ -37,6 +39,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
 namespace sandhook {
 
@@ -61,6 +64,7 @@ typedef std::uintptr_t Address;
 #define HOOK_INVALID_TARGET 6
 #define HOOK_BOUNDS_EXCEEDED 7
 #define HOOK_THREAD_SUSPENSION_FAILED 8
+#define HOOK_OUT_OF_RANGE 9 // Nuevo error para Single Insn Hook
 
 // ============================================================================
 // MEMORY UTILITIES
@@ -71,12 +75,10 @@ static inline Address align_down(Address v, std::size_t a = kPageSize) {
 }
 
 static inline Address align_up(Address v, std::size_t a = kPageSize) {
-    // FIX Bug 14: Proper overflow handling
     Address aligned_down = v & ~(static_cast<Address>(a - 1));
     return (v == aligned_down) ? v : (aligned_down + a);
 }
 
-// FIX Bug 2: Safe hex_dump with proper bounds checking
 static void hex_dump(const char* label, const void* data, std::size_t size) {
     LOGI("HEX: %s (%zu bytes):", label, size);
     const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(data);
@@ -84,7 +86,6 @@ static void hex_dump(const char* label, const void* data, std::size_t size) {
         char line[256];
         int written = 0;
         
-        // Write offset
         int ret = snprintf(line, sizeof(line), "  +%04zx: ", i);
         if (ret <= 0 || ret >= (int)sizeof(line)) {
             LOGE("hex_dump: buffer overflow");
@@ -92,7 +93,6 @@ static void hex_dump(const char* label, const void* data, std::size_t size) {
         }
         written = ret;
         
-        // Write bytes with bounds checking
         for (std::size_t j = 0; j < 16 && (i + j) < size; ++j) {
             ret = snprintf(line + written, sizeof(line) - written, "%02X ", bytes[i + j]);
             if (ret <= 0 || (written + ret) >= (int)sizeof(line)) {
@@ -106,7 +106,6 @@ static void hex_dump(const char* label, const void* data, std::size_t size) {
     }
 }
 
-// FIX Bug 10: Two-step mmap: RW first, then mprotect to RX
 class ExecMemGuard {
     void* ptr_ = nullptr;
     std::size_t size_ = 0;
@@ -115,7 +114,6 @@ public:
     ExecMemGuard() = default;
     
     explicit ExecMemGuard(std::size_t size) : size_(size) {
-        // Step 1: Allocate as RW (Android 10+ allows this)
         ptr_ = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (!ptr_ || ptr_ == MAP_FAILED) {
@@ -125,7 +123,6 @@ public:
         }
         LOGI("[mmap] Allocated %zu bytes at %p (RW)", size, ptr_);
         
-        // Step 2: Make executable
         if (::mprotect(ptr_, size, PROT_READ | PROT_EXEC) != 0) {
             LOGE("[mprotect] RX conversion FAILED: errno=%d", errno);
             ::munmap(ptr_, size);
@@ -185,22 +182,11 @@ struct Mem {
         return page_protect(addr, len, PROT_READ | PROT_EXEC);
     }
 
-    static bool make_rwx(void* addr, std::size_t len) {
-        return page_protect(addr, len, PROT_READ | PROT_WRITE | PROT_EXEC);
-    }
-
-    // FIX Bug 8: Complete cache flushing with ARM64 barriers
     static void flush_caches(void* addr, std::size_t len) {
-        // Data cache synchronization
         __builtin___clear_cache(reinterpret_cast<char*>(addr), 
                                reinterpret_cast<char*>(addr) + len);
-        
-        // ISB - Instruction Synchronization Barrier
         asm volatile("isb" ::: "memory");
-        
-        // DSB - Data Synchronization Barrier
         asm volatile("dsb sy" ::: "memory");
-        
         LOGD("[cache] Flushed %p (%zu bytes) with ISB+DSB", addr, len);
     }
 };
@@ -216,11 +202,9 @@ enum class Kind {
     CBZ, CBNZ, TBZ, TBNZ, Other
 };
 
-// FIX Bug 6: Correct opcode decoding with proper masking
 static inline Kind decode_kind(std::uint32_t insn) {
     if (insn == 0xD503201F) return Kind::NOP;
 
-    // Conditional branches (CBZ, CBNZ, TBZ, TBNZ)
     if ((insn & 0x7E000000) == 0x34000000) {
         if ((insn & 0x01000000) == 0) return Kind::CBZ;
         else return Kind::CBNZ;
@@ -230,12 +214,9 @@ static inline Kind decode_kind(std::uint32_t insn) {
         else return Kind::TBNZ;
     }
 
-    // Unconditional branches with proper mask
     if ((insn & 0xFC000000) == 0x14000000) return Kind::B;
     if ((insn & 0xFC000000) == 0x94000000) return Kind::BL;
 
-    // FIX Bug 6: Correct mask for BR/BLR/RET (0xD4000000, not 0xD6000000)
-    // BR/BLR/RET with correct mask
     if ((insn & 0xFC000000) == 0xD4000000) {
         if ((insn & 0xFFFFFC1F) == 0xD65F0000) return Kind::RET;
         if ((insn & 0xFFFFFC1F) == 0xD61F0000) return Kind::BR;
@@ -243,14 +224,11 @@ static inline Kind decode_kind(std::uint32_t insn) {
         return Kind::Other;
     }
 
-    // ADR/ADRP
     if ((insn & 0x9F000000) == 0x10000000) return Kind::ADR;
     if ((insn & 0x9F000000) == 0x90000000) return Kind::ADRP;
 
-    // LDR (literal)
     if ((insn & 0xFF000000) == 0x58000000) return Kind::LDR_LIT;
 
-    // MOVZ/MOVK
     if ((insn & 0xFF800000) == 0xD2800000) return Kind::MOVZ;
     if ((insn & 0xFF800000) == 0xF2800000) return Kind::MOVK;
 
@@ -264,19 +242,10 @@ struct Asm {
             out += 4;
         };
         
-        // MOVZ x16, #imm16 (bits 0-15)
         emit32(0xD2800000 | (16 & 31) | ((target & 0xFFFFULL) << 5));
-        
-        // MOVK x16, #imm16, lsl #16 (bits 16-31)
         emit32(0xF2800000 | (16 & 31) | (((target >> 16) & 0xFFFFULL) << 5) | (1u << 21));
-        
-        // MOVK x16, #imm16, lsl #32 (bits 32-47)
         emit32(0xF2800000 | (16 & 31) | (((target >> 32) & 0xFFFFULL) << 5) | (2u << 21));
-        
-        // MOVK x16, #imm16, lsl #48 (bits 48-63)
         emit32(0xF2800000 | (16 & 31) | (((target >> 48) & 0xFFFFULL) << 5) | (3u << 21));
-        
-        // BR x16
         emit32(0xD61F0000 | ((16 & 31) << 5));
     }
 
@@ -291,7 +260,7 @@ struct Asm {
 } // namespace arm64
 
 // ============================================================================
-// RELOCATION (All bugs fixed, including ADR 21-bit immediate)
+// RELOCATION
 // ============================================================================
 
 struct Relocator {
@@ -301,7 +270,6 @@ struct Relocator {
         int error = HOOK_OK;
     };
 
-    // FIX Bug 13: Safe immediate extraction using memcpy (no strict aliasing)
     static std::uint32_t read_insn(const void* p) {
         std::uint32_t insn = 0;
         std::memcpy(&insn, p, 4);
@@ -314,55 +282,21 @@ struct Relocator {
         return val;
     }
 
-    // FIX Bug 7: Proper ADRP assembly with non-contiguous fields
     static std::uint32_t assemble_adrp(std::uint32_t orig, std::int32_t imm21) {
-        // ADRP immediate encoding:
-        //   - immlo: bits 30:29 of instruction
-        //   - immhi: bits 23:5 of instruction
-        //   - Full immediate is: (immhi << 2) | immlo
-        
-        // Clear all immediate bits first
-        std::uint32_t result = orig & 0x9F00001F;  // Keep opcode/register, clear immediates
-        
-        // Extract immhi (bits 20:0 of imm21) → goes to bits 23:5
-        std::uint32_t immhi = (imm21 >> 2) & 0x7FFFF;   // bits 20:2 of imm21
-        
-        // Extract immlo (bits 1:0 of imm21) → goes to bits 30:29
-        std::uint32_t immlo = imm21 & 0x3;               // bits 1:0 of imm21
-        
-        // Insert into correct positions
-        result |= (immhi << 5);   // immhi at bits 23:5
-        result |= (immlo << 29);  // immlo at bits 30:29
-        
-        LOGD("[ADRP] orig=%08x, imm21=%d → immhi=%x(bits 23:5), immlo=%x(bits 30:29), result=%08x",
-             orig, imm21, immhi, immlo, result);
-        
+        std::uint32_t result = orig & 0x9F00001F;
+        std::uint32_t immhi = (imm21 >> 2) & 0x7FFFF;
+        std::uint32_t immlo = imm21 & 0x3;
+        result |= (immhi << 5);
+        result |= (immlo << 29);
         return result;
     }
 
-    // FIX: ADR usa 21 bits de inmediato (igual que ADRP, sin desplazamiento de página)
     static std::uint32_t assemble_adr(std::uint32_t orig, std::int32_t imm21) {
-        // ADR immediate encoding (igual estructura que ADRP, 21 bits):
-        //   - immlo: bits 30:29 of instruction
-        //   - immhi: bits 23:5 of instruction
-        //   - Full immediate is: (immhi << 2) | immlo
-        
-        // Clear all immediate bits first
-        std::uint32_t result = orig & 0x9F00001F;  // Keep opcode/register, clear immediates
-        
-        // Extract immhi (bits 20:2 of imm21) → goes to bits 23:5
-        std::uint32_t immhi = (imm21 >> 2) & 0x7FFFF;   // 19 bits
-        
-        // Extract immlo (bits 1:0 of imm21) → goes to bits 30:29
-        std::uint32_t immlo = imm21 & 0x3;               // 2 bits
-        
-        // Insert into correct positions
-        result |= (immhi << 5);   // immhi at bits 23:5
-        result |= (immlo << 29);  // immlo at bits 30:29
-        
-        LOGD("[ADR] orig=%08x, imm21=%d → immhi=%x(bits 23:5), immlo=%x(bits 30:29), result=%08x",
-             orig, imm21, immhi, immlo, result);
-        
+        std::uint32_t result = orig & 0x9F00001F;
+        std::uint32_t immhi = (imm21 >> 2) & 0x7FFFF;
+        std::uint32_t immlo = imm21 & 0x3;
+        result |= (immhi << 5);
+        result |= (immlo << 29);
         return result;
     }
 
@@ -374,37 +308,28 @@ struct Relocator {
         Address src_addr = reinterpret_cast<Address>(src);
         Address tramp_addr = reinterpret_cast<Address>(tramp);
 
-        LOGD("[Relocate] src=%p, tramp=%p, min_patch=%zu", src, tramp, min_patch);
-
         std::size_t copied = 0;
         while (copied < min_patch) {
             if (copied + 4 > kMaxPrologueSize) {
-                LOGE("[Relocate] BOUNDS_EXCEEDED");
                 r.error = HOOK_BOUNDS_EXCEEDED;
                 return r;
             }
 
-            // FIX Bug 13: Use memcpy to read instruction
             std::uint32_t insn = read_insn(s + copied);
             auto kind = arm64::decode_kind(insn);
 
             if (kind == arm64::Kind::Unknown) {
-                LOGE("[Relocate] Unknown instruction at offset %zu", copied);
                 r.error = HOOK_RELOCATION_FAILED;
                 return r;
             }
 
             std::uint32_t reloced = insn;
-
-            // FIX Bug 5: Use src_addr + copied (not just src_addr)
             Address insn_addr = src_addr + copied;
 
             if (kind == arm64::Kind::ADRP) {
-                // Extract non-contiguous fields separately
                 std::int64_t immlo = (insn >> 29) & 0x3;
                 std::int64_t immhi = (insn >> 5) & 0x7FFFF;
                 std::int64_t imm21 = (immhi << 2) | immlo;
-                // Sign extend to 21 bits
                 if (imm21 & (1LL << 20)) imm21 |= -(1LL << 21);
                 
                 Address orig_target = (insn_addr & ~0xFFFULL) + (imm21 << 12);
@@ -414,14 +339,11 @@ struct Relocator {
                 std::int32_t new_imm21 = static_cast<std::int32_t>(new_offset >> 12);
                 
                 reloced = assemble_adrp(insn, new_imm21);
-                LOGD("[Relocate] ADRP: imm21=%ld -> %d", imm21, new_imm21);
             }
-            // FIX: ADR tiene 21 bits de inmediato, igual que ADRP (sin el << 12)
             else if (kind == arm64::Kind::ADR) {
                 std::int64_t immlo = (insn >> 29) & 0x3;
-                std::int64_t immhi = (insn >> 5) & 0x7FFFF; // 19 bits
+                std::int64_t immhi = (insn >> 5) & 0x7FFFF;
                 std::int64_t imm21 = (immhi << 2) | immlo;
-                // Sign extend a 21 bits
                 if (imm21 & (1LL << 20)) imm21 |= -(1LL << 21);
                 
                 Address orig_target = insn_addr + imm21;
@@ -431,7 +353,6 @@ struct Relocator {
                 std::int32_t new_imm21 = static_cast<std::int32_t>(new_offset);
                 
                 reloced = assemble_adr(insn, new_imm21);
-                LOGD("[Relocate] ADR: imm21=%ld -> %d", imm21, new_imm21);
             }
             else if (kind == arm64::Kind::LDR_LIT) {
                 std::int64_t imm19 = extract_imm(insn, 5, 19);
@@ -441,15 +362,12 @@ struct Relocator {
                                          static_cast<std::int64_t>(new_ldr_base);
                 
                 if (new_offset % 4 != 0 || new_offset < -(1LL << 20) || new_offset >= (1LL << 20)) {
-                    LOGE("[Relocate] LDR_LIT offset out of range: %ld", new_offset);
                     r.error = HOOK_RELOCATION_FAILED;
                     return r;
                 }
                 std::int32_t new_imm19 = static_cast<std::int32_t>(new_offset >> 2) & 0x7FFFF;
                 reloced = (insn & ~(0x7FFFF << 5)) | ((new_imm19 & 0x7FFFF) << 5);
-                LOGD("[Relocate] LDR_LIT: imm19=%ld -> %d", imm19, new_imm19);
             }
-            // FIX Bug 9: Handle conditional branches (CBZ, CBNZ, TBZ, TBNZ)
             else if (kind == arm64::Kind::CBZ || kind == arm64::Kind::CBNZ) {
                 std::int64_t imm19 = extract_imm(insn, 5, 19);
                 Address orig_target = insn_addr + (imm19 << 2);
@@ -458,13 +376,11 @@ struct Relocator {
                                          static_cast<std::int64_t>(new_cbz_base);
                 
                 if (new_offset % 4 != 0 || new_offset < -(1LL << 20) || new_offset >= (1LL << 20)) {
-                    LOGE("[Relocate] CBZ offset out of range: %ld", new_offset);
                     r.error = HOOK_RELOCATION_FAILED;
                     return r;
                 }
                 std::int32_t new_imm19 = static_cast<std::int32_t>(new_offset >> 2) & 0x7FFFF;
                 reloced = (insn & ~(0x7FFFF << 5)) | ((new_imm19 & 0x7FFFF) << 5);
-                LOGD("[Relocate] CBZ/CBNZ: imm19=%ld -> %d", imm19, new_imm19);
             }
             else if (kind == arm64::Kind::TBZ || kind == arm64::Kind::TBNZ) {
                 std::int64_t imm14 = extract_imm(insn, 5, 14);
@@ -474,16 +390,13 @@ struct Relocator {
                                          static_cast<std::int64_t>(new_tbz_base);
                 
                 if (new_offset % 4 != 0 || new_offset < -(1LL << 15) || new_offset >= (1LL << 15)) {
-                    LOGE("[Relocate] TBZ offset out of range: %ld", new_offset);
                     r.error = HOOK_RELOCATION_FAILED;
                     return r;
                 }
                 std::int32_t new_imm14 = static_cast<std::int32_t>(new_offset >> 2) & 0x3FFF;
                 reloced = (insn & ~(0x3FFF << 5)) | ((new_imm14 & 0x3FFF) << 5);
-                LOGD("[Relocate] TBZ/TBNZ: imm14=%ld -> %d", imm14, new_imm14);
             }
             else if (kind == arm64::Kind::B || kind == arm64::Kind::BL) {
-                LOGE("[Relocate] Unconditional B/BL not supported in prologue");
                 r.error = HOOK_RELOCATION_FAILED;
                 return r;
             }
@@ -492,7 +405,6 @@ struct Relocator {
             copied += 4;
         }
 
-        // Emit jump back to original
         arm64::Asm::emit_movz_movk_br(t + copied, src_addr + copied);
         
         r.copied = copied;
@@ -503,19 +415,8 @@ struct Relocator {
 };
 
 // ============================================================================
-// THREAD SAFETY - Enhanced StopTheWorld
+// THREAD SAFETY
 // ============================================================================
-
-// WARNING: This is NOT a true stop-the-world pause. Real thread suspension requires
-// OS-level mechanisms (SIGSTOP/SIGCONT + /proc/self/task iteration).
-// This implementation provides:
-// 1. Mutex-based serialization for hook installation (recursive_mutex handles recursion)
-// 2. Atomic patch window minimization
-// 3. Cache coherency guarantees
-//
-// LIMITATION: Concurrent hooking of the SAME function from multiple threads is unsafe.
-// BEST PRACTICE: Perform all hook installations early (e.g., in JNI_OnLoad) before
-// heavy concurrent access to hooked functions begins.
 
 class StopTheWorld {
 private:
@@ -546,9 +447,10 @@ struct Hook {
     void* replacement = nullptr;
     void* trampoline = nullptr;
     std::size_t patch_size = 0;
-    std::size_t tramp_size = 0;  // FIX Bug 1: Store size for cleanup
+    std::size_t tramp_size = 0;
     std::vector<std::uint8_t> backup;
     bool active = false;
+    bool is_single_insn = false; // Nuevo: Marca si es un hook de 1 sola instrucción
 };
 
 // ============================================================================
@@ -562,86 +464,109 @@ public:
         return hm;
     }
 
+    // Hook estándar (20 bytes)
     int install(void* target, void* replacement, void** original_out) {
-        StopTheWorld stop;  // Acquire global serialization lock
+        StopTheWorld stop;
         std::lock_guard<std::recursive_mutex> lk(mu_);
         
-        LOGI("=== INSTALL START ===");
-        LOGI("Target: %p", target);
-        LOGI("Replacement: %p", replacement);
-        
-        if (!target || !replacement) {
-            LOGE("NULL_ARGS");
-            return HOOK_NULL_ARGS;
-        }
-        
-        if (hooks_.count(target)) {
-            LOGE("ALREADY_HOOKED");
-            return HOOK_ALREADY_HOOKED;
-        }
+        if (!target || !replacement) return HOOK_NULL_ARGS;
+        if (hooks_.count(target)) return HOOK_ALREADY_HOOKED;
 
         ExecMemGuard tramp_guard(kTrampolineSize);
         void* tramp = tramp_guard.get();
-        if (!tramp) {
-            LOGE("ALLOC_FAILED");
-            return HOOK_ALLOC_FAILED;
-        }
+        if (!tramp) return HOOK_ALLOC_FAILED;
 
         auto rel = Relocator::relocate(target, tramp, kMinPatchSize);
-        if (rel.error != HOOK_OK) {
-            LOGE("Relocation failed");
-            return rel.error;
-        }
-        LOGI("Relocated %zu bytes", rel.copied);
+        if (rel.error != HOOK_OK) return rel.error;
 
         Hook h;
         h.target = target;
         h.replacement = replacement;
         h.trampoline = tramp;
         h.patch_size = rel.copied;
-        h.tramp_size = rel.tramp_size;  // FIX Bug 1: Store for cleanup
+        h.tramp_size = rel.tramp_size;
         h.backup.resize(h.patch_size);
         std::memcpy(h.backup.data(), target, h.patch_size);
 
-        if (!Mem::make_rw(target, h.patch_size)) {
-            LOGE("make_rw FAILED");
-            return HOOK_MPROTECT_FAILED;
-        }
-        LOGI("Target made RW");
+        if (!Mem::make_rw(target, h.patch_size)) return HOOK_MPROTECT_FAILED;
 
         std::uint8_t patch[32];
         arm64::Asm::emit_movz_movk_br(patch, reinterpret_cast<Address>(replacement));
-        
         std::memcpy(target, patch, kMinPatchSize);
         arm64::Asm::fill_nops(reinterpret_cast<std::uint8_t*>(target), kMinPatchSize, h.patch_size);
 
-        // FIX Bug 8: Flush BOTH trampoline AND target caches
         Mem::flush_caches(tramp, rel.tramp_size);
         Mem::flush_caches(target, h.patch_size);
 
-        hex_dump("PATCHED TARGET", target, h.patch_size);
-        hex_dump("TRAMPOLINE", tramp, rel.tramp_size);
-
-        // FIX Bug 12: Ensure target is RX (not just RW)
         if (!Mem::make_rx(target, h.patch_size)) {
-            LOGE("make_rx FAILED - reverting patch");
             std::memcpy(target, h.backup.data(), h.backup.size());
             Mem::flush_caches(target, h.patch_size);
             return HOOK_MPROTECT_FAILED;
         }
-        LOGI("Target set to RX (executable)");
 
         h.active = true;
         hooks_.try_emplace(target, std::move(h));
         if (original_out) *original_out = tramp;
         
-        LOGI("=== INSTALL SUCCESS ===");
         tramp_guard.release();
         return HOOK_OK;
     }
 
+    // NUEVO: Single Instruction Hook (4 bytes)
+    int install_single_insn(void* target, void* replacement, void** original_out) {
+        StopTheWorld stop;
+        std::lock_guard<std::recursive_mutex> lk(mu_);
+
+        if (!target || !replacement) return HOOK_NULL_ARGS;
+        if (hooks_.count(target)) return HOOK_ALREADY_HOOKED;
+
+        // Si el usuario solicita un backup (original_out), un salto relativo de 4 bytes 
+        // no tiene espacio para generar un trampolín absoluto seguro. Caemos al método de 20 bytes.
+        if (original_out != nullptr) {
+            LOGW("[SingleInsn] Backup requested. Falling back to standard 20-byte hook.");
+            return install(target, replacement, original_out);
+        }
+
+        std::int64_t offset = reinterpret_cast<std::int64_t>(replacement) - reinterpret_cast<std::int64_t>(target);
+        
+        // Verificar si el destino está dentro del rango de un salto B (±128 MB)
+        if (offset >= -(1LL << 27) && offset < (1LL << 27)) {
+            
+            Hook h;
+            h.target = target;
+            h.replacement = replacement;
+            h.patch_size = 4; // Solo 1 instrucción
+            h.is_single_insn = true;
+            h.backup.resize(4);
+            std::memcpy(h.backup.data(), target, 4);
+
+            if (!Mem::make_rw(target, 4)) return HOOK_MPROTECT_FAILED;
+
+            // Construir salto relativo B
+            std::uint32_t imm26 = (static_cast<std::uint32_t>(offset >> 2)) & 0x03FFFFFF;
+            std::uint32_t insn = 0x14000000 | imm26; // Opcode B + imm26
+            
+            std::memcpy(target, &insn, 4);
+            Mem::flush_caches(target, 4);
+
+            if (!Mem::make_rx(target, 4)) {
+                std::memcpy(target, h.backup.data(), 4);
+                Mem::flush_caches(target, 4);
+                return HOOK_MPROTECT_FAILED;
+            }
+
+            h.active = true;
+            hooks_.try_emplace(target, std::move(h));
+            LOGI("[SingleInsn] Successfully hooked with 4-byte relative branch.");
+            return HOOK_OK;
+        }
+
+        LOGW("[SingleInsn] Out of 128MB range. Falling back to standard 20-byte hook.");
+        return install(target, replacement, original_out);
+    }
+
     int remove(void* target) {
-        StopTheWorld stop;  // Acquire global serialization lock
+        StopTheWorld stop;
         std::lock_guard<std::recursive_mutex> lk(mu_);
         auto it = hooks_.find(target);
         if (it == hooks_.end()) return HOOK_INVALID_TARGET;
@@ -656,20 +581,17 @@ public:
                 std::memcpy(h.target, h.backup.data(), h.backup.size());
                 Mem::flush_caches(h.target, h.backup.size());
                 
-                // FIX Bug 12: Restore RX permissions
                 if (!Mem::make_rx(h.target, h.backup.size())) {
                     LOGE("Failed to restore RX permissions");
                     result = HOOK_MPROTECT_FAILED;
                 }
             }
             h.active = false;
-            LOGI("Hook removed from %p", target);
         }
         
-        // FIX Bug 1: Free trampoline memory (always executed)
-        if (h.trampoline) {
+        // Liberar trampolín solo si no es single_insn (que no asignó memoria extra)
+        if (h.trampoline && !h.is_single_insn) {
             ::munmap(h.trampoline, kTrampolineSize);
-            LOGD("[munmap] Freed trampoline %zu bytes", kTrampolineSize);
         }
         
         hooks_.erase(it);
@@ -689,7 +611,7 @@ private:
 };
 
 // ============================================================================
-// PUBLIC C API (FIX Bug 11: C-compatible)
+// PUBLIC C API
 // ============================================================================
 
 extern "C" {
@@ -703,6 +625,11 @@ void* sandhook_install(void* target, void* replacement, void** original_out) {
     return (err == HOOK_OK) ? target : nullptr;
 }
 
+// NUEVA API EXPUESTA
+int sandhook_install_single_insn(void* target, void* replacement, void** original_out) {
+    return HookManager::instance().install_single_insn(target, replacement, original_out);
+}
+
 int sandhook_remove(void* target) {
     return HookManager::instance().remove(target);
 }
@@ -712,7 +639,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-2.1";  // Bumped version for ADR fix
+    return "sandhook-arm64-production-3.0"; // Versión subida por nueva feature
 }
 
 const char* sandhook_error_string(int err) {
@@ -726,6 +653,7 @@ const char* sandhook_error_string(int err) {
         case HOOK_INVALID_TARGET: return "INVALID_TARGET";
         case HOOK_BOUNDS_EXCEEDED: return "BOUNDS_EXCEEDED";
         case HOOK_THREAD_SUSPENSION_FAILED: return "THREAD_SUSPENSION_FAILED";
+        case HOOK_OUT_OF_RANGE: return "OUT_OF_RANGE";
         default: return "UNKNOWN_ERROR";
     }
 }
