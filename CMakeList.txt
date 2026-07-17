@@ -36,4 +36,5 @@ target_compile_options(sandhook PRIVATE
 # Link required Android libraries
 target_link_libraries(sandhook
     log    # For __android_log_print
+    dl     # For dlopen/dlsym in art_hook.cpp
 )
