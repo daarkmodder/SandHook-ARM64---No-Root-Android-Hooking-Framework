@@ -1,9 +1,10 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
 // All critical bugs from fable-5 analysis FIXED (including ADR 21-bit immediate)
-// ADDED: Single Instruction Hook Support (Step 1)
+// ADDED: Single Instruction Hook Support
 // FIXED: W^X compliance for ExecMemGuard (RW allocation, RX lock after write)
 // FIXED: Android 10+ execmod bypass via MAP_FIXED anonymous mapping fallback
+// ADDED: Unconditional B/BL absolute relocation (And64InlineHook/Dobby style)
 
 #include <cstdint>
 #include <cstddef>
@@ -280,7 +281,7 @@ struct Asm {
 } // namespace arm64
 
 // ============================================================================
-// RELOCATION
+// RELOCATION (With Unconditional Branch Absolute Jump Support)
 // ============================================================================
 
 struct Relocator {
@@ -328,7 +329,9 @@ struct Relocator {
         Address src_addr = reinterpret_cast<Address>(src);
         Address tramp_addr = reinterpret_cast<Address>(tramp);
 
-        std::size_t copied = 0;
+        std::size_t copied = 0;       // Bytes leídos de la fuente
+        std::size_t tramp_offset = 0; // Bytes escritos en el trampolín
+
         while (copied < min_patch) {
             if (copied + 4 > kMaxPrologueSize) {
                 r.error = HOOK_BOUNDS_EXCEEDED;
@@ -353,12 +356,14 @@ struct Relocator {
                 if (imm21 & (1LL << 20)) imm21 |= -(1LL << 21);
                 
                 Address orig_target = (insn_addr & ~0xFFFULL) + (imm21 << 12);
-                Address new_adrp_base = (tramp_addr + copied) & ~0xFFFULL;
+                Address new_adrp_base = (tramp_addr + tramp_offset) & ~0xFFFULL;
                 std::int64_t new_offset = static_cast<std::int64_t>(orig_target) - 
                                          static_cast<std::int64_t>(new_adrp_base);
                 std::int32_t new_imm21 = static_cast<std::int32_t>(new_offset >> 12);
                 
                 reloced = assemble_adrp(insn, new_imm21);
+                std::memcpy(t + tramp_offset, &reloced, 4);
+                tramp_offset += 4;
             }
             else if (kind == arm64::Kind::ADR) {
                 std::int64_t immlo = (insn >> 29) & 0x3;
@@ -367,19 +372,21 @@ struct Relocator {
                 if (imm21 & (1LL << 20)) imm21 |= -(1LL << 21);
                 
                 Address orig_target = insn_addr + imm21;
-                Address new_adr_base = tramp_addr + copied;
+                Address new_adr_base = tramp_addr + tramp_offset;
                 std::int64_t new_offset = static_cast<std::int64_t>(orig_target) - 
                                          static_cast<std::int64_t>(new_adr_base);
                 std::int32_t new_imm21 = static_cast<std::int32_t>(new_offset);
                 
                 reloced = assemble_adr(insn, new_imm21);
+                std::memcpy(t + tramp_offset, &reloced, 4);
+                tramp_offset += 4;
             }
-            else if (kind == arm64::Kind::LDR_LIT) {
+            else if (kind == arm64::Kind::LDR_LIT || kind == arm64::Kind::CBZ || kind == arm64::Kind::CBNZ) {
                 std::int64_t imm19 = extract_imm(insn, 5, 19);
                 Address orig_target = insn_addr + (imm19 << 2);
-                Address new_ldr_base = tramp_addr + copied;
+                Address new_base = tramp_addr + tramp_offset;
                 std::int64_t new_offset = static_cast<std::int64_t>(orig_target) - 
-                                         static_cast<std::int64_t>(new_ldr_base);
+                                         static_cast<std::int64_t>(new_base);
                 
                 if (new_offset % 4 != 0 || new_offset < -(1LL << 20) || new_offset >= (1LL << 20)) {
                     r.error = HOOK_RELOCATION_FAILED;
@@ -387,27 +394,15 @@ struct Relocator {
                 }
                 std::int32_t new_imm19 = static_cast<std::int32_t>(new_offset >> 2) & 0x7FFFF;
                 reloced = (insn & ~(0x7FFFF << 5)) | ((new_imm19 & 0x7FFFF) << 5);
-            }
-            else if (kind == arm64::Kind::CBZ || kind == arm64::Kind::CBNZ) {
-                std::int64_t imm19 = extract_imm(insn, 5, 19);
-                Address orig_target = insn_addr + (imm19 << 2);
-                Address new_cbz_base = tramp_addr + copied;
-                std::int64_t new_offset = static_cast<std::int64_t>(orig_target) - 
-                                         static_cast<std::int64_t>(new_cbz_base);
-                
-                if (new_offset % 4 != 0 || new_offset < -(1LL << 20) || new_offset >= (1LL << 20)) {
-                    r.error = HOOK_RELOCATION_FAILED;
-                    return r;
-                }
-                std::int32_t new_imm19 = static_cast<std::int32_t>(new_offset >> 2) & 0x7FFFF;
-                reloced = (insn & ~(0x7FFFF << 5)) | ((new_imm19 & 0x7FFFF) << 5);
+                std::memcpy(t + tramp_offset, &reloced, 4);
+                tramp_offset += 4;
             }
             else if (kind == arm64::Kind::TBZ || kind == arm64::Kind::TBNZ) {
                 std::int64_t imm14 = extract_imm(insn, 5, 14);
                 Address orig_target = insn_addr + (imm14 << 2);
-                Address new_tbz_base = tramp_addr + copied;
+                Address new_base = tramp_addr + tramp_offset;
                 std::int64_t new_offset = static_cast<std::int64_t>(orig_target) - 
-                                         static_cast<std::int64_t>(new_tbz_base);
+                                         static_cast<std::int64_t>(new_base);
                 
                 if (new_offset % 4 != 0 || new_offset < -(1LL << 15) || new_offset >= (1LL << 15)) {
                     r.error = HOOK_RELOCATION_FAILED;
@@ -415,20 +410,49 @@ struct Relocator {
                 }
                 std::int32_t new_imm14 = static_cast<std::int32_t>(new_offset >> 2) & 0x3FFF;
                 reloced = (insn & ~(0x3FFF << 5)) | ((new_imm14 & 0x3FFF) << 5);
+                std::memcpy(t + tramp_offset, &reloced, 4);
+                tramp_offset += 4;
             }
+            // MEJORA NIVEL DOBBY/AND64INLINEHOOK: Relocalización de saltos incondicionales B/BL
             else if (kind == arm64::Kind::B || kind == arm64::Kind::BL) {
-                r.error = HOOK_RELOCATION_FAILED;
-                return r;
+                std::int64_t imm26 = static_cast<std::int64_t>(insn & 0x03FFFFFF);
+                if (imm26 & (1LL << 25)) imm26 |= -(1LL << 26);
+                
+                Address target_addr = insn_addr + (imm26 << 2);
+                
+                // FIX DE ALINEACIÓN: LDR X16 requiere que la dirección esté alineada a 8 bytes
+                if ((tramp_offset % 8) != 0) {
+                    std::uint32_t nop = 0xD503201F;
+                    std::memcpy(t + tramp_offset, &nop, 4);
+                    tramp_offset += 4;
+                }
+
+                // LDR X16, [PC, #8] -> Carga la dirección absoluta en X16
+                std::uint32_t ldr_x16 = 0x58000050;  
+                // BR X16 (o BLR X16 si era un BL)
+                std::uint32_t br_x16 = (kind == arm64::Kind::BL) ? 0xD63F0200 : 0xD61F0200; 
+                
+                std::memcpy(t + tramp_offset, &ldr_x16, 4);
+                tramp_offset += 4;
+                std::memcpy(t + tramp_offset, &br_x16, 4);
+                tramp_offset += 4;
+                std::memcpy(t + tramp_offset, &target_addr, 8);
+                tramp_offset += 8;
+            }
+            else {
+                // Instrucción normal, copiar tal cual
+                std::memcpy(t + tramp_offset, &insn, 4);
+                tramp_offset += 4;
             }
 
-            std::memcpy(t + copied, &reloced, 4);
             copied += 4;
         }
 
-        arm64::Asm::emit_movz_movk_br(t + copied, src_addr + copied);
+        // Emitir salto de regreso a la función original
+        arm64::Asm::emit_movz_movk_br(t + tramp_offset, src_addr + copied);
         
         r.copied = copied;
-        r.tramp_size = copied + 20;
+        r.tramp_size = tramp_offset + 20;
         r.error = HOOK_OK;
         return r;
     }
@@ -662,7 +686,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-3.0";
+    return "sandhook-arm64-production-3.1"; // Versión subida por relocalización absoluta
 }
 
 const char* sandhook_error_string(int err) {

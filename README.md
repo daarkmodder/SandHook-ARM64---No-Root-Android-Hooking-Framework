@@ -1,13 +1,14 @@
+```markdown
 # SandHook ARM64 - Production Android Hooking Framework
 
 Un framework de hooking de métodos en línea (inline hooking) de nivel producción para Android ARM64. Funciona sin root y es compatible con Android 5.0 hasta Android 13+. 
 
-Este framework utiliza un motor nativo en C++ altamente optimizado capaz de bypassear las restricciones de seguridad más estrictas de Android moderno (SELinux `execmod`, W^X).
+Este framework utiliza un motor nativo en C++ altamente optimizado, capaz de bypassear las restricciones de seguridad más estrictas de Android moderno (SELinux `execmod`, W^X) y relocalizar cualquier tipo de prólogo de función, igualando e incluso superando a motores como Dobby o And64InlineHook.
 
 > ⚠️ **Aviso de Compatibilidad:** 
 > Este framework está escrito y optimizado estrictamente para **C++**. Permite enlazar código C fácilmente, pero el núcleo requiere compilación con `clang++` y la librería estándar de C++. Existe la posibilidad de que en el futuro se porte a C puro, pero por ahora no está garantizado.
 
-**Versión:** 3.0 (Production)  
+**Versión:** 3.1 (Production)  
 **Arquitectura:** Android ARM64 (aarch64) únicamente  
 **Requisitos:** Android 5.0+ (API 21+), No se requiere Root.
 
@@ -15,12 +16,13 @@ Este framework utiliza un motor nativo en C++ altamente optimizado capaz de bypa
 
 ## ✨ Características Principales
 
-- ✅ **Hook Nativo:** Intercepta funciones C/C++ mediante parcheo de memoria directo y trampolines.
-- ✅ **Single Instruction Hook (Fast Hook):** Soporte para parchear atómicamente solo 4 bytes (1 instrucción) usando saltos relativos si el destino está en un rango de 128MB.
-- ✅ **Bypass Android 10/13 (`execmod`):** Implementa un fallback con `mmap` anónimo (`MAP_FIXED`) para bypassar las restricciones de SELinux que impiden ejecutar código modificado de librerías mapeadas.
-- ✅ **Cumplimiento W^X:** Asignación de memoria en dos pasos (RW para escritura, RX para ejecución) para evitar violaciones de SELinux.
-- ✅ **Relocalización ARM64 Completa:** Analiza y reescribe instrucciones PC-relativas (ADRP, ADR, LDR_LIT, CBZ, TBZ) garantizando trampolines seguros.
-- ✅ **Thread Safety (StopTheWorld):** Sincronización basada en `std::recursive_mutex` para evitar deadlocks al hookear funciones anidadas.
+- ✅ **Hook Nativo:** Intercepta funciones C/C++ mediante parcheo de memoria directo y trampolines dinámicos.
+- ✅ **Relocalización Absoluta (Nivel Dobby):** Soporte completo para funciones que comienzan con saltos incondicionales (`B` / `BL`). El motor calcula la dirección absoluta y genera un salto seguro (`LDR X16` + `BR X16`), permitiendo hookear funciones que otros motores rechazan.
+- ✅ **Single Instruction Hook (Fast Hook):** Soporte para parchear atómicamente solo 4 bytes (1 instrucción) usando saltos relativos si el destino está en un rango de 128MB. Si se solicita un backup, cae inteligentemente al método de 20 bytes.
+- ✅ **Bypass Android 10/13 (`execmod`):** Implementa un fallback con `mmap` anónimo (`MAP_FIXED`) para bypassar las restricciones de SELinux que impiden ejecutar código modificado de librerías mapeadas en memoria.
+- ✅ **Cumplimiento W^X:** Asignación de memoria en dos pasos (RW para escritura, RX para ejecución) para evitar violaciones de SELinux en Android 10+.
+- ✅ **Relocalización ARM64 Completa:** Analiza y reescribe instrucciones PC-relativas (`ADRP`, `ADR`, `LDR_LIT`, `CBZ`, `CBNZ`, `TBZ`, `TBNZ`) garantizando trampolines seguros.
+- ✅ **Thread Safety (StopTheWorld):** Sincronización basada en `std::recursive_mutex` para evitar deadlocks al hookear funciones anidadas o desde múltiples hilos.
 
 ---
 
@@ -111,20 +113,20 @@ void init_native_hooks() {
 
 ## 🔒 Seguridad y Compatibilidad
 
-- **SELinux Bypass:** El motor detecta automáticamente cuando el sistema bloquea la ejecución de código modificado (`errno=13 EACCES`) y utiliza `mmap` con `MAP_FIXED` para reemplazar la página por una anónima, engañando al kernel y permitiendo la ejecución.
+- **SELinux Bypass (`execmod`):** El motor detecta automáticamente cuando el sistema bloquea la ejecución de código modificado (`errno=13 EACCES`) y utiliza `mmap` con `MAP_FIXED` para reemplazar la página por una anónima, engañando al kernel y permitiendo la ejecución en Android 10, 11, 12 y 13.
+- **Relocalización de Saltos Largos:** A diferencia de motores básicos, SandHook no falla (`RELOCATION_FAILED`) si la función objetivo empieza con un salto incondicional (`B`/`BL`). Convierte el salto relativo en un salto absoluto en el trampolín, garantizando la ejecución del código original.
 - **Concurrencia:** El uso de `std::recursive_mutex` garantiza que no haya condiciones de carrera (race conditions) al instalar o remover hooks en funciones concurrentes.
-- **Limitaciones:** No se pueden hookear funciones cuya primera instrucción sea un salto incondicional (`B` o `BL`), ya que no se puede calcular un destino seguro para el trampolín.
 
 ---
 
 ## 👥 Créditos
 
-Desarrollado y mantenido por:
+Desarrollado, parcheado y mantenido por:
 
-- **GML-5.2** - Ingeniería inversa, arquitectura del núcleo y bypasses de seguridad.
-- **DᴀʀᴋMᴏᴅᴅᴇʀ** - Implementación nativa, relocalización ARM64 y pruebas de integración.
+- **GML-5.2** - Ingeniería inversa, arquitectura del núcleo, relocalización absoluta y bypasses de seguridad.
+- **DᴀʀᴋMᴏᴅᴅᴇʀ** - Implementación nativa, integración NDK, relocalización ARM64 y pruebas de estrés en tiempo de ejecución.
 
-Basado en los conceptos originales del ecosistema SandHook.
+Basado en los conceptos originales del ecosistema SandHook, And64InlineHook (Rprop) y Dobby.
 
 ## Licencia
 Uso educativo y de investigación. Prohibida su distribución comercial sin autorización.
