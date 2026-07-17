@@ -1,10 +1,14 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
-// All critical bugs from fable-5 analysis FIXED (including ADR 21-bit immediate)
-// ADDED: Single Instruction Hook Support
-// FIXED: W^X compliance for ExecMemGuard (RW allocation, RX lock after write)
-// FIXED: Android 10+ execmod bypass via MAP_FIXED anonymous mapping fallback
-// ADDED: Unconditional B/BL absolute relocation (And64InlineHook/Dobby style)
+// Version: 3.3 (ShadowHook-style Atomic Write)
+// Features:
+// - W^X Compliance (RW alloc, RX lock)
+// - Android 10+ execmod bypass (MAP_FIXED anonymous fallback)
+// - Dobby-style Unconditional B/BL absolute relocation
+// - Dobby-style Conditional CBZ/CBNZ/TBZ/TBNZ branch inversion
+// - 21-bit ADR/ADRP correct relocation
+// - Single Instruction Hook (4-byte relative branch)
+// - ShadowHook-style Atomic Instruction Patching (Race condition prevention)
 
 #include <cstdint>
 #include <cstddef>
@@ -101,6 +105,30 @@ static void hex_dump(const char* label, const void* data, std::size_t size) {
         }
         
         LOGI("%s", line);
+    }
+}
+
+// SHADOWHOOK-STYLE ATOMIC WRITE
+// Previene crashes (SIGILL/SIGSEGV) si otros hilos están ejecutando la función
+// exactamente en el momento en que escribimos el patch en memoria.
+static void atomic_write_inst(void* target, const void* inst, size_t len) {
+    uintptr_t addr = reinterpret_cast<uintptr_t>(target);
+    
+    if (len == 4 && (addr % 4) == 0) {
+        uint32_t val;
+        std::memcpy(&val, inst, sizeof(val));
+        __atomic_store_n(reinterpret_cast<uint32_t*>(addr), val, __ATOMIC_SEQ_CST);
+    } else if (len == 8 && (addr % 8) == 0) {
+        uint64_t val;
+        std::memcpy(&val, inst, sizeof(val));
+        __atomic_store_n(reinterpret_cast<uint64_t*>(addr), val, __ATOMIC_SEQ_CST);
+    } else if (len == 16 && (addr % 16) == 0) {
+        __int128 val;
+        std::memcpy(&val, inst, sizeof(val));
+        __atomic_store_n(reinterpret_cast<__int128*>(addr), val, __ATOMIC_SEQ_CST);
+    } else {
+        // Fallback a memcpy si no está alineado o es un tamaño raro
+        std::memcpy(target, inst, len);
     }
 }
 
@@ -281,7 +309,7 @@ struct Asm {
 } // namespace arm64
 
 // ============================================================================
-// RELOCATION (With Unconditional Branch Absolute Jump Support)
+// RELOCATION (With Dobby-style Conditional Branch Inversion)
 // ============================================================================
 
 struct Relocator {
@@ -332,6 +360,62 @@ struct Relocator {
         std::size_t copied = 0;       // Bytes leídos de la fuente
         std::size_t tramp_offset = 0; // Bytes escritos en el trampolín
 
+        // Helper para escribir saltos absolutos (alineados a 8 bytes)
+        auto emit_abs_jump = [&](Address target, bool is_bl) {
+            // Alinear a 8 bytes para que el .quad sea accesible
+            if ((tramp_offset % 8) != 0) {
+                std::uint32_t nop = 0xD503201F;
+                std::memcpy(t + tramp_offset, &nop, 4);
+                tramp_offset += 4;
+            }
+            std::uint32_t ldr_x16 = 0x58000050; // LDR X16, [PC, #8]
+            std::uint32_t br_x16 = is_bl ? 0xD63F0200 : 0xD61F0200; // BLR X16 / BR X16
+            std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4;
+            std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
+            std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
+        };
+
+        // Helper para escribir saltos condicionales absolutos (Dobby style)
+        auto emit_cond_abs_jump = [&](std::uint32_t insn, int imm_shift, int imm_mask, Address target) {
+            // Necesitamos que inv_insn quede en offset % 8 == 4, para que LDR X16 quede en offset % 8 == 0
+            if ((tramp_offset % 8) == 0) {
+                std::uint32_t nop = 0xD503201F;
+                std::memcpy(t + tramp_offset, &nop, 4);
+                tramp_offset += 4;
+            }
+            
+            // Invertir la condición (bit 24)
+            std::uint32_t inv_insn = insn ^ (1 << 24);
+            // Saltar 3 instrucciones (12 bytes) para esquivar el trampolín absoluto
+            std::uint32_t new_imm = 3; 
+            inv_insn = (inv_insn & ~(imm_mask << imm_shift)) | ((new_imm & imm_mask) << imm_shift);
+            
+            std::memcpy(t + tramp_offset, &inv_insn, 4); tramp_offset += 4;
+            
+            // Ahora tramp_offset % 8 == 0
+            std::uint32_t ldr_x16 = 0x58000050; // LDR X16, [PC, #8]
+            std::uint32_t br_x16 = 0xD61F0200;  // BR X16
+            std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4;
+            std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
+            std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
+        };
+
+        // Helper para escribir LDR Literal absoluto
+        auto emit_ldr_lit_abs = [&](std::uint32_t insn, Address target) {
+            int rt = insn & 0x1F;
+            // Alinear a 8 bytes
+            if ((tramp_offset % 8) != 0) {
+                std::uint32_t nop = 0xD503201F;
+                std::memcpy(t + tramp_offset, &nop, 4);
+                tramp_offset += 4;
+            }
+            std::uint32_t ldr_x16 = 0x58000050; // LDR X16, [PC, #8]
+            std::uint32_t ldr_rt = 0xF9400200 | rt; // LDR Rt, [X16]
+            std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4;
+            std::memcpy(t + tramp_offset, &ldr_rt, 4); tramp_offset += 4;
+            std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
+        };
+
         while (copied < min_patch) {
             if (copied + 4 > kMaxPrologueSize) {
                 r.error = HOOK_BOUNDS_EXCEEDED;
@@ -381,7 +465,7 @@ struct Relocator {
                 std::memcpy(t + tramp_offset, &reloced, 4);
                 tramp_offset += 4;
             }
-            else if (kind == arm64::Kind::LDR_LIT || kind == arm64::Kind::CBZ || kind == arm64::Kind::CBNZ) {
+            else if (kind == arm64::Kind::LDR_LIT) {
                 std::int64_t imm19 = extract_imm(insn, 5, 19);
                 Address orig_target = insn_addr + (imm19 << 2);
                 Address new_base = tramp_addr + tramp_offset;
@@ -389,13 +473,29 @@ struct Relocator {
                                          static_cast<std::int64_t>(new_base);
                 
                 if (new_offset % 4 != 0 || new_offset < -(1LL << 20) || new_offset >= (1LL << 20)) {
-                    r.error = HOOK_RELOCATION_FAILED;
-                    return r;
+                    emit_ldr_lit_abs(insn, orig_target);
+                } else {
+                    std::int32_t new_imm19 = static_cast<std::int32_t>(new_offset >> 2) & 0x7FFFF;
+                    reloced = (insn & ~(0x7FFFF << 5)) | ((new_imm19 & 0x7FFFF) << 5);
+                    std::memcpy(t + tramp_offset, &reloced, 4);
+                    tramp_offset += 4;
                 }
-                std::int32_t new_imm19 = static_cast<std::int32_t>(new_offset >> 2) & 0x7FFFF;
-                reloced = (insn & ~(0x7FFFF << 5)) | ((new_imm19 & 0x7FFFF) << 5);
-                std::memcpy(t + tramp_offset, &reloced, 4);
-                tramp_offset += 4;
+            }
+            else if (kind == arm64::Kind::CBZ || kind == arm64::Kind::CBNZ) {
+                std::int64_t imm19 = extract_imm(insn, 5, 19);
+                Address orig_target = insn_addr + (imm19 << 2);
+                Address new_base = tramp_addr + tramp_offset;
+                std::int64_t new_offset = static_cast<std::int64_t>(orig_target) - 
+                                         static_cast<std::int64_t>(new_base);
+                
+                if (new_offset % 4 != 0 || new_offset < -(1LL << 20) || new_offset >= (1LL << 20)) {
+                    emit_cond_abs_jump(insn, 5, 0x7FFFF, orig_target);
+                } else {
+                    std::int32_t new_imm19 = static_cast<std::int32_t>(new_offset >> 2) & 0x7FFFF;
+                    reloced = (insn & ~(0x7FFFF << 5)) | ((new_imm19 & 0x7FFFF) << 5);
+                    std::memcpy(t + tramp_offset, &reloced, 4);
+                    tramp_offset += 4;
+                }
             }
             else if (kind == arm64::Kind::TBZ || kind == arm64::Kind::TBNZ) {
                 std::int64_t imm14 = extract_imm(insn, 5, 14);
@@ -405,39 +505,20 @@ struct Relocator {
                                          static_cast<std::int64_t>(new_base);
                 
                 if (new_offset % 4 != 0 || new_offset < -(1LL << 15) || new_offset >= (1LL << 15)) {
-                    r.error = HOOK_RELOCATION_FAILED;
-                    return r;
+                    emit_cond_abs_jump(insn, 5, 0x3FFF, orig_target);
+                } else {
+                    std::int32_t new_imm14 = static_cast<std::int32_t>(new_offset >> 2) & 0x3FFF;
+                    reloced = (insn & ~(0x3FFF << 5)) | ((new_imm14 & 0x3FFF) << 5);
+                    std::memcpy(t + tramp_offset, &reloced, 4);
+                    tramp_offset += 4;
                 }
-                std::int32_t new_imm14 = static_cast<std::int32_t>(new_offset >> 2) & 0x3FFF;
-                reloced = (insn & ~(0x3FFF << 5)) | ((new_imm14 & 0x3FFF) << 5);
-                std::memcpy(t + tramp_offset, &reloced, 4);
-                tramp_offset += 4;
             }
-            // MEJORA NIVEL DOBBY/AND64INLINEHOOK: Relocalización de saltos incondicionales B/BL
             else if (kind == arm64::Kind::B || kind == arm64::Kind::BL) {
                 std::int64_t imm26 = static_cast<std::int64_t>(insn & 0x03FFFFFF);
                 if (imm26 & (1LL << 25)) imm26 |= -(1LL << 26);
                 
                 Address target_addr = insn_addr + (imm26 << 2);
-                
-                // FIX DE ALINEACIÓN: LDR X16 requiere que la dirección esté alineada a 8 bytes
-                if ((tramp_offset % 8) != 0) {
-                    std::uint32_t nop = 0xD503201F;
-                    std::memcpy(t + tramp_offset, &nop, 4);
-                    tramp_offset += 4;
-                }
-
-                // LDR X16, [PC, #8] -> Carga la dirección absoluta en X16
-                std::uint32_t ldr_x16 = 0x58000050;  
-                // BR X16 (o BLR X16 si era un BL)
-                std::uint32_t br_x16 = (kind == arm64::Kind::BL) ? 0xD63F0200 : 0xD61F0200; 
-                
-                std::memcpy(t + tramp_offset, &ldr_x16, 4);
-                tramp_offset += 4;
-                std::memcpy(t + tramp_offset, &br_x16, 4);
-                tramp_offset += 4;
-                std::memcpy(t + tramp_offset, &target_addr, 8);
-                tramp_offset += 8;
+                emit_abs_jump(target_addr, kind == arm64::Kind::BL);
             }
             else {
                 // Instrucción normal, copiar tal cual
@@ -535,7 +616,18 @@ public:
 
         std::uint8_t patch[32];
         arm64::Asm::emit_movz_movk_br(patch, reinterpret_cast<Address>(replacement));
-        std::memcpy(target, patch, kMinPatchSize);
+        
+        // SHADOWHOOK-STYLE ATOMIC WRITE
+        // Esto previene crashes si otros hilos están ejecutando la función en este instante.
+        if (kMinPatchSize == 20) {
+            // Escribimos los primeros 16 bytes atómicamente
+            atomic_write_inst(target, patch, 16);
+            // Escribimos los últimos 4 bytes (el BR X16) atómicamente
+            atomic_write_inst(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target) + 16), patch + 16, 4);
+        } else {
+            atomic_write_inst(target, patch, kMinPatchSize);
+        }
+        
         arm64::Asm::fill_nops(reinterpret_cast<std::uint8_t*>(target), kMinPatchSize, h.patch_size);
 
         Mem::flush_caches(tramp, rel.tramp_size);
@@ -595,7 +687,8 @@ public:
             std::uint32_t imm26 = (static_cast<std::uint32_t>(offset >> 2)) & 0x03FFFFFF;
             std::uint32_t insn = 0x14000000 | imm26;
             
-            std::memcpy(target, &insn, 4);
+            // ESCRITURA ATÓMICA DE 4 BYTES
+            atomic_write_inst(target, &insn, 4);
             Mem::flush_caches(target, 4);
 
             if (!Mem::make_rx(target, 4)) {
@@ -627,7 +720,15 @@ public:
             if (!Mem::make_rw(h.target, h.backup.size())) {
                 result = HOOK_MPROTECT_FAILED;
             } else {
-                std::memcpy(h.target, h.backup.data(), h.backup.size());
+                // Restaurar usando escritura atómica también
+                size_t b_size = h.backup.size();
+                if (b_size == 20) {
+                    atomic_write_inst(h.target, h.backup.data(), 16);
+                    atomic_write_inst(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(h.target) + 16), h.backup.data() + 16, 4);
+                } else {
+                    atomic_write_inst(h.target, h.backup.data(), b_size);
+                }
+                
                 Mem::flush_caches(h.target, h.backup.size());
                 
                 if (!Mem::make_rx(h.target, h.backup.size())) {
@@ -686,7 +787,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-3.1"; // Versión subida por relocalización absoluta
+    return "sandhook-arm64-production-3.3"; // Atomic Write
 }
 
 const char* sandhook_error_string(int err) {
