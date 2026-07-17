@@ -1,4 +1,3 @@
-```markdown
 # SandHook ARM64 - Production Android Hooking Framework
 
 Un framework de hooking de métodos en línea (inline hooking) de nivel producción para Android ARM64. Funciona sin root y es compatible con Android 5.0 hasta Android 13+. 
