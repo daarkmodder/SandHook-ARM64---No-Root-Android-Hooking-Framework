@@ -29,33 +29,24 @@ Java_com_swift_sandhook_SandHook_nativeHookMethod(JNIEnv* env, jclass clazz,
                                                    jobject originMethod, 
                                                    jobject hookMethod, 
                                                    jobject backupMethod) {
-    if (!originMethod || !hookMethod) {
-        LOGE("originMethod or hookMethod is null");
-        return JNI_FALSE;
-    }
-
+    if (!originMethod || !hookMethod) return JNI_FALSE;
     ensure_art_initialized(env);
 
     jmethodID origin_meth = env->FromReflectedMethod(originMethod);
     jmethodID hook_meth = env->FromReflectedMethod(hookMethod);
-
-    if (!origin_meth || !hook_meth) {
-        LOGE("Failed to get jmethodID");
-        return JNI_FALSE;
-    }
+    if (!origin_meth || !hook_meth) return JNI_FALSE;
 
     void* origin_addr = sandhook::art::getQuickEntryPoint(origin_meth);
     void* hook_addr = sandhook::art::getQuickEntryPoint(hook_meth);
-
-    if (!origin_addr || !hook_addr) {
-        LOGE("Failed to get native entry points");
-        return JNI_FALSE;
-    }
+    if (!origin_addr || !hook_addr) return JNI_FALSE;
 
     LOGI("Hooking Origin: %p -> Replacement: %p", origin_addr, hook_addr);
 
+    // --- STOP THE WORLD REAL ---
+    // Suspender la VM de Android para que el Garbage Collector no mueva la memoria
+    sandhook::art::suspendVM_Runtime();
+
     void* trampoline = nullptr;
-    // Solo pedimos trampolín si hay backup
     int result = sandhook_install_ex(origin_addr, hook_addr, 
                                      (backupMethod != nullptr) ? &trampoline : nullptr);
 
@@ -63,30 +54,17 @@ Java_com_swift_sandhook_SandHook_nativeHookMethod(JNIEnv* env, jclass clazz,
         if (backupMethod != nullptr && trampoline != nullptr) {
             jmethodID backup_meth = env->FromReflectedMethod(backupMethod);
             if (backup_meth) {
-                // El trampolín no tiene PAC, se puede asignar directamente
                 sandhook::art::setQuickEntryPoint(backup_meth, trampoline);
-                LOGI("Backup method redirected to trampoline at %p", trampoline);
             }
         }
-        return JNI_TRUE;
     }
 
+    // Reanudar la VM de Android
+    sandhook::art::resumeVM_Runtime();
+
+    if (result == HOOK_OK) return JNI_TRUE;
     LOGE("Hook installation failed: %s", sandhook_error_string(result));
     return JNI_FALSE;
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_swift_sandhook_SandHook_nativeUnhookMethod(JNIEnv* env, jclass clazz, jobject originMethod) {
-    if (!originMethod) return JNI_FALSE;
-
-    jmethodID origin_meth = env->FromReflectedMethod(originMethod);
-    if (!origin_meth) return JNI_FALSE;
-
-    void* origin_addr = sandhook::art::getQuickEntryPoint(origin_meth);
-    if (!origin_addr) return JNI_FALSE;
-
-    int result = sandhook_remove(origin_addr);
-    return (result == HOOK_OK) ? JNI_TRUE : JNI_FALSE;
 }
 
 } // extern "C"
