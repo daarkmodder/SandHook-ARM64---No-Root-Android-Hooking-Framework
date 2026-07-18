@@ -1,9 +1,10 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
-// Version: 3.3 (ShadowHook-style Atomic Write)
+// Version: 3.4 (CFI Bypass + Atomic Write + Dobby Relocation)
 // Features:
 // - W^X Compliance (RW alloc, RX lock)
 // - Android 10+ execmod bypass (MAP_FIXED anonymous fallback)
+// - Android 8.0+ CFI Slowpath bypass (ByteHook style)
 // - Dobby-style Unconditional B/BL absolute relocation
 // - Dobby-style Conditional CBZ/CBNZ/TBZ/TBNZ branch inversion
 // - 21-bit ADR/ADRP correct relocation
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cerrno>
+#include <dlfcn.h>
 
 #include <vector>
 #include <string>
@@ -43,6 +45,49 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
+// ============================================================================
+// CFI BYPASS (Control Flow Integrity - Android 8.0+)
+// Evita SIGILL al saltar a trampolines no registrados en libdl.so
+// ============================================================================
+
+#if defined(__aarch64__)
+#define CFI_ARM64_RET_INST 0xd65f03c0
+
+static bool g_cfi_disabled = false;
+
+static void disableCFISlowpath() {
+    if (g_cfi_disabled) return;
+    
+    void* handle = dlopen("libdl.so", RTLD_NOW);
+    if (!handle) return;
+
+    void* slowpath = dlsym(handle, "__cfi_slowpath");
+    void* slowpath_diag = dlsym(handle, "__cfi_slowpath_diag");
+    
+    if (slowpath && slowpath_diag) {
+        uintptr_t start = (uintptr_t)slowpath < (uintptr_t)slowpath_diag ? (uintptr_t)slowpath : (uintptr_t)slowpath_diag;
+        uintptr_t end = (uintptr_t)slowpath < (uintptr_t)slowpath_diag ? (uintptr_t)slowpath_diag : (uintptr_t)slowpath;
+        size_t size = (end - start) + sizeof(uint32_t);
+        
+        uintptr_t page_start = start & ~0xFFFULL;
+        size_t page_len = ((start + size - page_start) + 0xFFF) & ~0xFFFULL;
+        
+        if (mprotect((void*)page_start, page_len, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            *((uint32_t*)slowpath) = CFI_ARM64_RET_INST;
+            *((uint32_t*)slowpath_diag) = CFI_ARM64_RET_INST;
+            __builtin___clear_cache((char*)start, (char*)(start + size));
+            g_cfi_disabled = true;
+            LOGI("[CFI] Slowpath disabled successfully.");
+        } else {
+            LOGE("[CFI] mprotect failed: %d", errno);
+        }
+    }
+    dlclose(handle);
+}
+#else
+static void disableCFISlowpath() {}
+#endif
+
 namespace sandhook {
 
 // ============================================================================
@@ -56,7 +101,6 @@ static constexpr std::size_t kMaxPrologueSize = 200;
 
 typedef std::uintptr_t Address;
 
-// Error codes - C-compatible (plain int)
 #define HOOK_OK 0
 #define HOOK_NULL_ARGS 1
 #define HOOK_ALREADY_HOOKED 2
@@ -109,8 +153,6 @@ static void hex_dump(const char* label, const void* data, std::size_t size) {
 }
 
 // SHADOWHOOK-STYLE ATOMIC WRITE
-// Previene crashes (SIGILL/SIGSEGV) si otros hilos están ejecutando la función
-// exactamente en el momento en que escribimos el patch en memoria.
 static void atomic_write_inst(void* target, const void* inst, size_t len) {
     uintptr_t addr = reinterpret_cast<uintptr_t>(target);
     
@@ -127,7 +169,6 @@ static void atomic_write_inst(void* target, const void* inst, size_t len) {
         std::memcpy(&val, inst, sizeof(val));
         __atomic_store_n(reinterpret_cast<__int128*>(addr), val, __ATOMIC_SEQ_CST);
     } else {
-        // Fallback a memcpy si no está alineado o es un tamaño raro
         std::memcpy(target, inst, len);
     }
 }
@@ -140,7 +181,6 @@ public:
     ExecMemGuard() = default;
     
     explicit ExecMemGuard(std::size_t size) : size_(size) {
-        // CORRECCIÓN W^X: Asignamos solo como Lectura y Escritura (RW)
         ptr_ = ::mmap(nullptr, size, PROT_READ | PROT_WRITE,
                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (!ptr_ || ptr_ == MAP_FAILED) {
@@ -197,24 +237,18 @@ struct Mem {
         return page_protect(addr, len, PROT_READ | PROT_WRITE);
     }
 
-    // FIXED: Android 10+ execmod bypass
     static bool make_rx(void* addr, std::size_t len) {
-        // 1. Intentamos el método normal primero
         if (page_protect(addr, len, PROT_READ | PROT_EXEC)) return true;
         
-        // 2. BYPASS ANDROID 10+ (execmod):
-        // Si mprotect falla con EACCES, remapeamos la página como memoria anónima.
         LOGW("[mprotect] R-X failed. Falling back to anonymous mapping (execmem bypass).");
         
         Address start = align_down(reinterpret_cast<Address>(addr));
         Address end = align_up(reinterpret_cast<Address>(addr) + len);
         std::size_t page_len = end - start;
         
-        // Hacemos un backup de la memoria actual (que ya tiene nuestro patch inyectado)
         std::vector<std::uint8_t> backup(page_len);
         std::memcpy(backup.data(), reinterpret_cast<void*>(start), page_len);
         
-        // Creamos una página anónima EXACTAMENTE en la misma dirección física (MAP_FIXED)
         void* new_mem = ::mmap(reinterpret_cast<void*>(start), page_len, 
                                PROT_READ | PROT_WRITE, 
                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
@@ -224,10 +258,7 @@ struct Mem {
             return false;
         }
         
-        // Copiamos el contenido patcheado a la nueva página anónima
         std::memcpy(new_mem, backup.data(), page_len);
-        
-        // Ahora sí, como es memoria anónima, el sistema nos permite hacerla Ejecutable
         return page_protect(new_mem, page_len, PROT_READ | PROT_EXEC);
     }
 
@@ -360,9 +391,7 @@ struct Relocator {
         std::size_t copied = 0;       // Bytes leídos de la fuente
         std::size_t tramp_offset = 0; // Bytes escritos en el trampolín
 
-        // Helper para escribir saltos absolutos (alineados a 8 bytes)
         auto emit_abs_jump = [&](Address target, bool is_bl) {
-            // Alinear a 8 bytes para que el .quad sea accesible
             if ((tramp_offset % 8) != 0) {
                 std::uint32_t nop = 0xD503201F;
                 std::memcpy(t + tramp_offset, &nop, 4);
@@ -375,24 +404,19 @@ struct Relocator {
             std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
         };
 
-        // Helper para escribir saltos condicionales absolutos (Dobby style)
         auto emit_cond_abs_jump = [&](std::uint32_t insn, int imm_shift, int imm_mask, Address target) {
-            // Necesitamos que inv_insn quede en offset % 8 == 4, para que LDR X16 quede en offset % 8 == 0
             if ((tramp_offset % 8) == 0) {
                 std::uint32_t nop = 0xD503201F;
                 std::memcpy(t + tramp_offset, &nop, 4);
                 tramp_offset += 4;
             }
             
-            // Invertir la condición (bit 24)
             std::uint32_t inv_insn = insn ^ (1 << 24);
-            // Saltar 3 instrucciones (12 bytes) para esquivar el trampolín absoluto
             std::uint32_t new_imm = 3; 
             inv_insn = (inv_insn & ~(imm_mask << imm_shift)) | ((new_imm & imm_mask) << imm_shift);
             
             std::memcpy(t + tramp_offset, &inv_insn, 4); tramp_offset += 4;
             
-            // Ahora tramp_offset % 8 == 0
             std::uint32_t ldr_x16 = 0x58000050; // LDR X16, [PC, #8]
             std::uint32_t br_x16 = 0xD61F0200;  // BR X16
             std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4;
@@ -400,10 +424,8 @@ struct Relocator {
             std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
         };
 
-        // Helper para escribir LDR Literal absoluto
         auto emit_ldr_lit_abs = [&](std::uint32_t insn, Address target) {
             int rt = insn & 0x1F;
-            // Alinear a 8 bytes
             if ((tramp_offset % 8) != 0) {
                 std::uint32_t nop = 0xD503201F;
                 std::memcpy(t + tramp_offset, &nop, 4);
@@ -521,7 +543,6 @@ struct Relocator {
                 emit_abs_jump(target_addr, kind == arm64::Kind::BL);
             }
             else {
-                // Instrucción normal, copiar tal cual
                 std::memcpy(t + tramp_offset, &insn, 4);
                 tramp_offset += 4;
             }
@@ -529,7 +550,6 @@ struct Relocator {
             copied += 4;
         }
 
-        // Emitir salto de regreso a la función original
         arm64::Asm::emit_movz_movk_br(t + tramp_offset, src_addr + copied);
         
         r.copied = copied;
@@ -593,6 +613,9 @@ public:
         StopTheWorld stop;
         std::lock_guard<std::recursive_mutex> lk(mu_);
         
+        // Desactivar CFI antes de instalar cualquier hook (solo la primera vez)
+        disableCFISlowpath();
+        
         if (!target || !replacement) return HOOK_NULL_ARGS;
         if (hooks_.count(target)) return HOOK_ALREADY_HOOKED;
 
@@ -617,12 +640,8 @@ public:
         std::uint8_t patch[32];
         arm64::Asm::emit_movz_movk_br(patch, reinterpret_cast<Address>(replacement));
         
-        // SHADOWHOOK-STYLE ATOMIC WRITE
-        // Esto previene crashes si otros hilos están ejecutando la función en este instante.
         if (kMinPatchSize == 20) {
-            // Escribimos los primeros 16 bytes atómicamente
             atomic_write_inst(target, patch, 16);
-            // Escribimos los últimos 4 bytes (el BR X16) atómicamente
             atomic_write_inst(reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(target) + 16), patch + 16, 4);
         } else {
             atomic_write_inst(target, patch, kMinPatchSize);
@@ -633,8 +652,6 @@ public:
         Mem::flush_caches(tramp, rel.tramp_size);
         Mem::flush_caches(target, h.patch_size);
 
-        // CORRECCIÓN W^X: Ahora que el trampolín está escrito y la caché limpia, 
-        // bloqueamos la memoria del trampolín como Solo Lectura y Ejecución (RX)
         if (!Mem::make_rx(tramp, kTrampolineSize)) {
             LOGE("Failed to make trampoline RX");
             return HOOK_MPROTECT_FAILED;
@@ -662,6 +679,8 @@ public:
         StopTheWorld stop;
         std::lock_guard<std::recursive_mutex> lk(mu_);
 
+        disableCFISlowpath();
+
         if (!target || !replacement) return HOOK_NULL_ARGS;
         if (hooks_.count(target)) return HOOK_ALREADY_HOOKED;
 
@@ -687,7 +706,6 @@ public:
             std::uint32_t imm26 = (static_cast<std::uint32_t>(offset >> 2)) & 0x03FFFFFF;
             std::uint32_t insn = 0x14000000 | imm26;
             
-            // ESCRITURA ATÓMICA DE 4 BYTES
             atomic_write_inst(target, &insn, 4);
             Mem::flush_caches(target, 4);
 
@@ -720,7 +738,6 @@ public:
             if (!Mem::make_rw(h.target, h.backup.size())) {
                 result = HOOK_MPROTECT_FAILED;
             } else {
-                // Restaurar usando escritura atómica también
                 size_t b_size = h.backup.size();
                 if (b_size == 20) {
                     atomic_write_inst(h.target, h.backup.data(), 16);
@@ -787,7 +804,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-3.3"; // Atomic Write
+    return "sandhook-arm64-production-3.4"; // CFI Bypass
 }
 
 const char* sandhook_error_string(int err) {
