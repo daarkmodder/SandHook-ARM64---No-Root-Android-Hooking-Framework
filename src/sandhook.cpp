@@ -1,6 +1,6 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
-// Version: 3.4 (CFI Bypass + Atomic Write + Dobby Relocation)
+// Version: 3.5 (SIGSEGV Protection + CFI Bypass + Atomic Write + Dobby Relocation)
 // Features:
 // - W^X Compliance (RW alloc, RX lock)
 // - Android 10+ execmod bypass (MAP_FIXED anonymous fallback)
@@ -10,6 +10,7 @@
 // - 21-bit ADR/ADRP correct relocation
 // - Single Instruction Hook (4-byte relative branch)
 // - ShadowHook-style Atomic Instruction Patching (Race condition prevention)
+// - SIGSEGV Protection during relocation (sigsetjmp/siglongjmp)
 
 #include <cstdint>
 #include <cstddef>
@@ -18,6 +19,8 @@
 #include <cstdio>
 #include <cerrno>
 #include <dlfcn.h>
+#include <signal.h>
+#include <setjmp.h>
 
 #include <vector>
 #include <string>
@@ -47,7 +50,6 @@
 
 // ============================================================================
 // CFI BYPASS (Control Flow Integrity - Android 8.0+)
-// Evita SIGILL al saltar a trampolines no registrados en libdl.so
 // ============================================================================
 
 #if defined(__aarch64__)
@@ -87,6 +89,25 @@ static void disableCFISlowpath() {
 #else
 static void disableCFISlowpath() {}
 #endif
+
+// ============================================================================
+// SIGSEGV PROTECTION (sigsetjmp / siglongjmp)
+// ============================================================================
+
+static thread_local sigjmp_buf g_hook_sig_jmpbuf;
+static thread_local bool g_hook_sig_active = false;
+static struct sigaction g_old_sigact;
+
+static void sandhook_sig_handler(int sig) {
+    if (g_hook_sig_active) {
+        g_hook_sig_active = false;
+        siglongjmp(g_hook_sig_jmpbuf, 1); // Salta de vuelta al punto seguro
+    } else {
+        // Si la señal no es nuestra, restauramos el handler original y crasheamos
+        sigaction(sig, &g_old_sigact, nullptr);
+        raise(sig);
+    }
+}
 
 namespace sandhook {
 
@@ -340,7 +361,7 @@ struct Asm {
 } // namespace arm64
 
 // ============================================================================
-// RELOCATION (With Dobby-style Conditional Branch Inversion)
+// RELOCATION (With SIGSEGV Protection & Dobby-style Branch Inversion)
 // ============================================================================
 
 struct Relocator {
@@ -388,8 +409,8 @@ struct Relocator {
         Address src_addr = reinterpret_cast<Address>(src);
         Address tramp_addr = reinterpret_cast<Address>(tramp);
 
-        std::size_t copied = 0;       // Bytes leídos de la fuente
-        std::size_t tramp_offset = 0; // Bytes escritos en el trampolín
+        std::size_t copied = 0;
+        std::size_t tramp_offset = 0;
 
         auto emit_abs_jump = [&](Address target, bool is_bl) {
             if ((tramp_offset % 8) != 0) {
@@ -397,8 +418,8 @@ struct Relocator {
                 std::memcpy(t + tramp_offset, &nop, 4);
                 tramp_offset += 4;
             }
-            std::uint32_t ldr_x16 = 0x58000050; // LDR X16, [PC, #8]
-            std::uint32_t br_x16 = is_bl ? 0xD63F0200 : 0xD61F0200; // BLR X16 / BR X16
+            std::uint32_t ldr_x16 = 0x58000050;
+            std::uint32_t br_x16 = is_bl ? 0xD63F0200 : 0xD61F0200;
             std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4;
             std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
             std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
@@ -417,8 +438,8 @@ struct Relocator {
             
             std::memcpy(t + tramp_offset, &inv_insn, 4); tramp_offset += 4;
             
-            std::uint32_t ldr_x16 = 0x58000050; // LDR X16, [PC, #8]
-            std::uint32_t br_x16 = 0xD61F0200;  // BR X16
+            std::uint32_t ldr_x16 = 0x58000050;
+            std::uint32_t br_x16 = 0xD61F0200;
             std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4;
             std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
             std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
@@ -431,8 +452,8 @@ struct Relocator {
                 std::memcpy(t + tramp_offset, &nop, 4);
                 tramp_offset += 4;
             }
-            std::uint32_t ldr_x16 = 0x58000050; // LDR X16, [PC, #8]
-            std::uint32_t ldr_rt = 0xF9400200 | rt; // LDR Rt, [X16]
+            std::uint32_t ldr_x16 = 0x58000050;
+            std::uint32_t ldr_rt = 0xF9400200 | rt;
             std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4;
             std::memcpy(t + tramp_offset, &ldr_rt, 4); tramp_offset += 4;
             std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
@@ -444,7 +465,31 @@ struct Relocator {
                 return r;
             }
 
-            std::uint32_t insn = read_insn(s + copied);
+            // --- INICIO DE PROTECCIÓN SIGSEGV ---
+            std::uint32_t insn = 0;
+            
+            struct sigaction act;
+            act.sa_handler = sandhook_sig_handler;
+            sigemptyset(&act.sa_mask);
+            act.sa_flags = 0;
+            sigaction(SIGSEGV, &act, &g_old_sigact);
+            
+            if (sigsetjmp(g_hook_sig_jmpbuf, 1) == 0) {
+                g_hook_sig_active = true;
+                insn = read_insn(s + copied); // LECTURA PELIGROSA
+            } else {
+                // Si llegamos aquí, ocurrió un SIGSEGV al leer
+                g_hook_sig_active = false;
+                sigaction(SIGSEGV, &g_old_sigact, nullptr); // Restaurar handler original
+                r.error = HOOK_INVALID_TARGET;
+                return r;
+            }
+            
+            // Restaurar handler original tras éxito
+            g_hook_sig_active = false;
+            sigaction(SIGSEGV, &g_old_sigact, nullptr);
+            // --- FIN DE PROTECCIÓN SIGSEGV ---
+
             auto kind = arm64::decode_kind(insn);
 
             if (kind == arm64::Kind::Unknown) {
@@ -613,7 +658,6 @@ public:
         StopTheWorld stop;
         std::lock_guard<std::recursive_mutex> lk(mu_);
         
-        // Desactivar CFI antes de instalar cualquier hook (solo la primera vez)
         disableCFISlowpath();
         
         if (!target || !replacement) return HOOK_NULL_ARGS;
@@ -804,7 +848,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-3.4"; // CFI Bypass
+    return "sandhook-arm64-production-3.5"; // SIGSEGV Protection
 }
 
 const char* sandhook_error_string(int err) {

@@ -2,12 +2,12 @@
 
 Un framework de hooking de métodos en línea (inline hooking) de **nivel empresarial** para Android ARM64. Funciona sin root y es compatible con Android 5.0 hasta Android 14+. 
 
-Este proyecto es el resultado de una fusión manual y depuración exhaustiva de las técnicas más avanzadas de los motores de hooking más respetados de la industria (Dobby, ShadowHook, ByteHook, And64InlineHook), combinadas en un núcleo C++ puro, limpio y ultrarrápido.
+Este proyecto es el resultado de una fusión manual y depuración exhaustiva de las técnicas más avanzadas de los motores de hooking más respetados de la industria (Dobby, ShadowHook, ByteHook, xHook, And64InlineHook), combinadas en un núcleo C++ puro, limpio y ultrarrápido.
 
 > ⚠️ **Aviso de Compatibilidad:** 
 > Este framework está escrito y optimizado estrictamente para **C++**. Permite enlazar código C fácilmente, pero el núcleo requiere compilación con `clang++` y la librería estándar de C++. 
 
-**Versión:** 3.4 (Production - CFI Bypass & Atomic Write)  
+**Versión:** 3.5 (Production - SIGSEGV Protection)  
 **Arquitectura:** Android ARM64 (aarch64) únicamente  
 **Requisitos:** Android 5.0+ (API 21+), No se requiere Root.
 
@@ -17,22 +17,25 @@ Este proyecto es el resultado de una fusión manual y depuración exhaustiva de 
 
 La mayoría de los motores de hooking de código abierto en GitHub tienen problemas críticos que causan crashes aleatorios en dispositivos modernos. Este framework los soluciona implementando técnicas de nivel Dios:
 
-1. **ByteHook-Style CFI Bypass (Android 8.0+):**
+1. **Protección contra SIGSEGV (xHook style):**
+   Si un desarrollador comete un error y le pasa a tu motor una dirección de memoria inválida o corrupta para hookear, en lugar de crashear la app con un `SIGSEGV` (Segmentation Fault), el motor utiliza `sigsetjmp` y `siglongjmp` para envolver la lectura de memoria. Si la lectura falla, el motor neutraliza la señal, aborta el hook de forma segura y devuelve un error limpio (`HOOK_INVALID_TARGET`).
+
+2. **ByteHook-Style CFI Bypass (Android 8.0+):**
    A partir de Oreo, Google implementó Control Flow Integrity (CFI). CFI mata la app con un `SIGILL` si detecta saltos indirectos (`BR X16`) a trampolines no registrados. Este motor parchea `__cfi_slowpath` en `libdl.so` en tiempo de ejecución, desactivando CFI de forma segura para que nuestros hooks pasen desapercibidos.
 
-2. **ShadowHook-Style Atomic Patching (Prevención de Race Conditions):**
+3. **ShadowHook-Style Atomic Patching (Prevención de Race Conditions):**
    No usamos `memcpy` estándar para inyectar el hook. Usamos instrucciones atómicas de hardware (`__atomic_store_n`). Esto significa que si 100 hilos están ejecutando la función objetivo en el milisegundo en que se inyecta el hook, el CPU leerá la instrucción vieja completa o la nueva completa, **pero nunca una mezcla corrupta**.
 
-3. **Android 10/13 SELinux Bypass (`execmod`):**
+4. **Android 10/13 SELinux Bypass (`execmod`):**
    En Android 10+, SELinux prohíbe ejecutar código modificado de librerías mapeadas (`errno=13 EACCES`). Si `mprotect` falla, el motor usa `mmap` con `MAP_FIXED` para reemplazar la página física por una anónima, engañando al kernel.
 
-4. **Dobby-Style Relocalización Absoluta (Cero Fallos):**
+5. **Dobby-Style Relocalización Absoluta (Cero Fallos):**
    Si la función objetivo empieza con saltos condicionales (`CBZ`, `TBZ`) o incondicionales (`B`, `BL`) que apuntan muy lejos, otros motores fallan. Este motor usa la técnica de Dobby: invierte la condición del salto localmente e inyecta un trampolín absoluto (`LDR X16` + `BR X16`).
 
-5. **PAC Stripping (Compatibilidad con ARMv8.3+ y Android 11+):**
+6. **PAC Stripping (Compatibilidad con ARMv8.3+ y Android 11+):**
    Los procesadores modernos usan PAC. La capa ART de este motor limpia la firma criptográfica de los punteros antes de pasarlos al motor nativo.
 
-6. **W^X Compliance Total:**
+7. **W^X Compliance Total:**
    Cumplimos estrictamente la regla Write-Xor-Execute. La memoria se asigna como `RW` y se bloquea como `RX` justo antes de usarla.
 
 ---
@@ -42,7 +45,7 @@ La mayoría de los motores de hooking de código abierto en GitHub tienen proble
 Es importante destacar que este framework **no es un simple resultado de copiar/pegar ni un milagro de la IA**. Su desarrollo y depuración requirió un dominio profundo de varias disciplinas de bajo nivel:
 * **Ensamblador ARM64 (AArch64):** Comprensión de conjuntos de instrucciones, relocalización de saltos PC-relativos (ADRP, CBZ), alineación de memoria y barreras de caché (ISB/DSB).
 * **C++ de bajo nivel:** Uso de metaprogramación, `std::atomic` para concurrencia sin locks, y gestión manual de memoria (mmap/munmap) evitando la STL en el núcleo crítico.
-* **C y Kernel de Linux (Bionic):** Interacción directa con syscalls, bypass de políticas SELinux y manejo de señales.
+* **C y Kernel de Linux (Bionic):** Interacción directa con syscalls, bypass de políticas SELinux y manejo de señales POSIX (`sigaction`, `sigsetjmp`).
 * **Java/ART (JNI):** Comprensión de la estructura interna de `ArtMethod`, manipulación de referencias globales yOffsets dinámicos para compatibilidad con Custom ROMs.
 
 Cada técnica implementada fue analizada, adaptada y probada bajo estrés en dispositivos físicos reales para garantizar su estabilidad.
@@ -51,7 +54,7 @@ Cada técnica implementada fue analizada, adaptada y probada bajo estrés en dis
 
 ## 🏗️ Arquitectura del Framework
 
-1. **`sandhook.cpp` (Motor Nativo v3.4):** Se encarga del ensamblador ARM64, escritura atómica, bypass de SELinux/CFI, relocalización absoluta y trampolines.
+1. **`sandhook.cpp` (Motor Nativo v3.5):** Se encarga del ensamblador ARM64, escritura atómica, bypass de SELinux/CFI, protección de señales SIGSEGV, relocalización absoluta y trampolines.
 2. **`sandhook.h` (API C Pública):** El contrato que expone el motor nativo.
 3. **`art_hook.cpp` (Capa ART):** Lee los offsets internos de Android, extrae direcciones nativas y aplica *PAC Stripping*.
 4. **`sandhook_jni.cpp` (Puente JNI):** Recibe llamadas desde Java, convierte objetos `Method` a direcciones `void*` (con limpieza de excepciones JNI) y gestiona el *StopTheWorld* (SuspendVM).
@@ -134,6 +137,19 @@ void init_native_hooks() {
 
 ---
 
+## 📖 Referencia de la API C
+
+| Función | Descripción |
+|---------|-------------|
+| `int sandhook_install_ex(void* target, void* replacement, void** original_out)` | Instala un hook estándar (20 bytes). Devuelve `HOOK_OK` (0) si tuvo éxito. |
+| `void* sandhook_install(void* target, void* replacement, void** original_out)` | Versión simplificada. Devuelve el `target` si tuvo éxito, o `NULL`. |
+| `int sandhook_install_single_insn(void* target, void* replacement, void** original_out)` | Intenta un hook de 4 bytes. Si está fuera de rango (>128MB) o se pide backup, cae al método de 20 bytes. |
+| `int sandhook_remove(void* target)` | Desinstala el hook y restaura la memoria original de forma atómica. |
+| `void* sandhook_trampoline(void* target)` | Obtiene el puntero al trampolín para ejecutar la función original. |
+| `const char* sandhook_error_string(int err)` | Convierte un código de error en texto legible. |
+
+---
+
 ## 👥 Créditos
 
 Desarrollado, parcheado y mantenido por:
@@ -145,6 +161,7 @@ Desarrollado, parcheado y mantenido por:
 - [Dobby](https://github.com/jmpews/Dobby) (Inversión de saltos condicionales).
 - [ShadowHook](https://github.com/bytedance/android-inline-hook) (Escritura atómica y PAC Stripping).
 - [ByteHook](https://github.com/bytedance/android-inline-hook) (Bypass de CFI Slowpath).
+- [xHook](https://github.com/iqiyi/xHook) (Manejo seguro de señales SIGSEGV).
 - [And64InlineHook](https://github.com/Rprop/And64InlineHook) (Relocalización de saltos absolutos).
 
 ## Licencia
