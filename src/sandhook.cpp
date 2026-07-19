@@ -1,8 +1,6 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
-// Version: 4.8 (Exec Mem Check + Dual Syscall Write Bypass) + New Message (PENDING)
-
-// Created by daarkmodder on 2026-07-19.
+// Version: 5.6 (Obfuscated Strings + Protection Aware + Safe GOT Fallback)
 
 #include <cstdint>
 #include <cstddef>
@@ -14,6 +12,8 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <sys/uio.h>
+#include <sstream>
+#include <fstream>
 
 #include <vector>
 #include <string>
@@ -31,6 +31,7 @@
 #include <elf.h>
 #include <android/log.h>
 #include "xdl/xdl.h"
+#include "obfuscate.h" // <-- Incluido para ofuscación de strings
 
 #ifndef PROT_BTI
 #define PROT_BTI 0x10
@@ -50,14 +51,58 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
+// Declaración anticipada para usar en CFI Bypass
+static bool write_mem_proc(void* addr, const void* data, size_t len);
+
 // ============================================================================
-// CFI BYPASS
+// PROTECTION DETECTION SYSTEM (Strings Ofuscados)
+// ============================================================================
+
+class ProtectionDetector {
+public:
+    static bool has_cfi() {
+        const char* status_path = AY_OBFUSCATE("/proc/self/status");
+        FILE* fp = fopen(status_path, "r");
+        if (!fp) return false;
+        char line[256];
+        bool cfi_enabled = false;
+        const char* cfi_tag = AY_OBFUSCATE("CFI:");
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, cfi_tag)) {
+                int val = 0;
+                if (sscanf(line, "CFI:\t%d", &val) == 1) {
+                    cfi_enabled = (val == 1);
+                    break;
+                }
+            }
+        }
+        fclose(fp);
+        return cfi_enabled;
+    }
+    
+    static bool is_selinux_enforcing() {
+        const char* selinux_path = AY_OBFUSCATE("/sys/fs/selinux/enforce");
+        FILE* fp = fopen(selinux_path, "r");
+        if (!fp) return false;
+        int enforce = 0;
+        if (fscanf(fp, "%d", &enforce) == 1) {
+            fclose(fp);
+            return enforce == 1;
+        }
+        fclose(fp);
+        return false;
+    }
+};
+
+// ============================================================================
+// CFI BYPASS (Strings Ofuscados)
 // ============================================================================
 
 #if defined(__aarch64__)
 #define CFI_ARM64_RET_INST 0xd65f03c0
 
 static bool g_cfi_disabled = false;
+static bool g_cfi_bypass_failed = false; 
 static uint32_t g_cfi_slowpath_backup = 0;
 static uint32_t g_cfi_slowpath_diag_backup = 0;
 static std::mutex g_cfi_mu;
@@ -65,46 +110,48 @@ static std::atomic<int> g_active_hook_count{0};
 
 static void disableCFISlowpath() {
     std::lock_guard<std::mutex> lk(g_cfi_mu);
-    if (g_cfi_disabled) return;
+    if (g_cfi_disabled || g_cfi_bypass_failed) return;
 
     void* slowpath = nullptr;
     void* slowpath_diag = nullptr;
 
-    const char* lib_names[] = {"libc.so", "libdl.so", "linker64", nullptr};
+    const char* lib1 = AY_OBFUSCATE("libc.so");
+    const char* lib2 = AY_OBFUSCATE("libdl.so");
+    const char* lib3 = AY_OBFUSCATE("linker64");
+    const char* sym1 = AY_OBFUSCATE("__cfi_slowpath");
+    const char* sym2 = AY_OBFUSCATE("__cfi_slowpath_diag");
+    
+    const char* lib_names[] = {lib1, lib2, lib3, nullptr};
     for (int i = 0; lib_names[i] != nullptr; ++i) {
         void* handle = xdl_open(lib_names[i], XDL_DEFAULT);
         if (!handle) continue;
 
-        slowpath = xdl_sym(handle, "__cfi_slowpath", nullptr);
-        if (!slowpath) slowpath = xdl_dsym(handle, "__cfi_slowpath", nullptr);
+        slowpath = xdl_sym(handle, sym1, nullptr);
+        if (!slowpath) slowpath = xdl_dsym(handle, sym1, nullptr);
 
-        slowpath_diag = xdl_sym(handle, "__cfi_slowpath_diag", nullptr);
-        if (!slowpath_diag) slowpath_diag = xdl_dsym(handle, "__cfi_slowpath_diag", nullptr);
+        slowpath_diag = xdl_sym(handle, sym2, nullptr);
+        if (!slowpath_diag) slowpath_diag = xdl_dsym(handle, sym2, nullptr);
 
         xdl_close(handle);
         if (slowpath && slowpath_diag) break;
     }
 
     if (slowpath && slowpath_diag) {
-        uintptr_t start = (uintptr_t)slowpath < (uintptr_t)slowpath_diag ? (uintptr_t)slowpath : (uintptr_t)slowpath_diag;
-        uintptr_t end   = (uintptr_t)slowpath < (uintptr_t)slowpath_diag ? (uintptr_t)slowpath_diag : (uintptr_t)slowpath;
-        size_t size = (end - start) + sizeof(uint32_t);
-
-        uintptr_t page_start = start & ~0xFFFULL;
-        size_t page_len = ((start + size - page_start) + 0xFFF) & ~0xFFFULL;
-
-        if (syscall(SYS_mprotect, (void*)page_start, page_len, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-            g_cfi_slowpath_backup = *((uint32_t*)slowpath);
-            g_cfi_slowpath_diag_backup = *((uint32_t*)slowpath_diag);
-            *((uint32_t*)slowpath) = CFI_ARM64_RET_INST;
-            *((uint32_t*)slowpath_diag) = CFI_ARM64_RET_INST;
-            __builtin___clear_cache((char*)start, (char*)(start + size));
+        uint32_t ret_inst = CFI_ARM64_RET_INST;
+        
+        if (write_mem_proc(slowpath, &ret_inst, sizeof(uint32_t)) && 
+            write_mem_proc(slowpath_diag, &ret_inst, sizeof(uint32_t))) {
+            
+            __builtin___clear_cache((char*)slowpath, (char*)((uintptr_t)slowpath + sizeof(uint32_t)));
+            __builtin___clear_cache((char*)slowpath_diag, (char*)((uintptr_t)slowpath_diag + sizeof(uint32_t)));
             g_cfi_disabled = true;
-            LOGI("[CFI] Slowpath disabled. Backups saved.");
+            LOGI("[CFI] Slowpath disabled via /proc/self/mem.");
         } else {
-            LOGE("[CFI] mprotect failed: %d", errno);
+            g_cfi_bypass_failed = true;
+            LOGE("[CFI] Failed to patch via /proc/self/mem. CFI remains active. Inline hooks will be skipped.");
         }
     } else {
+        g_cfi_bypass_failed = true;
         LOGE("[CFI] Could not find __cfi_slowpath via xDL.");
     }
 }
@@ -116,37 +163,34 @@ static void restoreCFISlowpath() {
     void* slowpath = nullptr;
     void* slowpath_diag = nullptr;
 
-    const char* lib_names[] = {"libc.so", "libdl.so", "linker64", nullptr};
+    const char* lib1 = AY_OBFUSCATE("libc.so");
+    const char* lib2 = AY_OBFUSCATE("libdl.so");
+    const char* lib3 = AY_OBFUSCATE("linker64");
+    const char* sym1 = AY_OBFUSCATE("__cfi_slowpath");
+    const char* sym2 = AY_OBFUSCATE("__cfi_slowpath_diag");
+    
+    const char* lib_names[] = {lib1, lib2, lib3, nullptr};
     for (int i = 0; lib_names[i] != nullptr; ++i) {
         void* handle = xdl_open(lib_names[i], XDL_DEFAULT);
         if (!handle) continue;
 
-        slowpath = xdl_sym(handle, "__cfi_slowpath", nullptr);
-        if (!slowpath) slowpath = xdl_dsym(handle, "__cfi_slowpath", nullptr);
+        slowpath = xdl_sym(handle, sym1, nullptr);
+        if (!slowpath) slowpath = xdl_dsym(handle, sym1, nullptr);
 
-        slowpath_diag = xdl_sym(handle, "__cfi_slowpath_diag", nullptr);
-        if (!slowpath_diag) slowpath_diag = xdl_dsym(handle, "__cfi_slowpath_diag", nullptr);
+        slowpath_diag = xdl_sym(handle, sym2, nullptr);
+        if (!slowpath_diag) slowpath_diag = xdl_dsym(handle, sym2, nullptr);
 
         xdl_close(handle);
         if (slowpath && slowpath_diag) break;
     }
 
     if (slowpath && slowpath_diag) {
-        uintptr_t start = (uintptr_t)slowpath < (uintptr_t)slowpath_diag ? (uintptr_t)slowpath : (uintptr_t)slowpath_diag;
-        uintptr_t end   = (uintptr_t)slowpath < (uintptr_t)slowpath_diag ? (uintptr_t)slowpath_diag : (uintptr_t)slowpath;
-        size_t size = (end - start) + sizeof(uint32_t);
-
-        uintptr_t page_start = start & ~0xFFFULL;
-        size_t page_len = ((start + size - page_start) + 0xFFF) & ~0xFFFULL;
-
-        if (syscall(SYS_mprotect, (void*)page_start, page_len, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-            *((uint32_t*)slowpath) = g_cfi_slowpath_backup;
-            *((uint32_t*)slowpath_diag) = g_cfi_slowpath_diag_backup;
-            __builtin___clear_cache((char*)start, (char*)(start + size));
+        if (write_mem_proc(slowpath, &g_cfi_slowpath_backup, sizeof(uint32_t)) && 
+            write_mem_proc(slowpath_diag, &g_cfi_slowpath_diag_backup, sizeof(uint32_t))) {
+            __builtin___clear_cache((char*)slowpath, (char*)((uintptr_t)slowpath + sizeof(uint32_t)));
+            __builtin___clear_cache((char*)slowpath_diag, (char*)((uintptr_t)slowpath_diag + sizeof(uint32_t)));
             g_cfi_disabled = false;
             LOGI("[CFI] Slowpath restored from backup.");
-        } else {
-            LOGE("[CFI] Restore mprotect failed: %d", errno);
         }
     }
 }
@@ -260,84 +304,97 @@ public:
 };
 
 // ============================================================================
-// MEMORY VALIDATION
+// MEMORY VALIDATION (Syscall Stealth Reader - Strings Ofuscados)
 // ============================================================================
+
+static bool read_proc_maps_syscall(std::string& out) {
+    const char* maps_path = AY_OBFUSCATE("/proc/self/maps");
+    int fd = syscall(SYS_openat, AT_FDCWD, maps_path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return false;
+    char buf[4096];
+    ssize_t n;
+    while ((n = syscall(SYS_read, fd, buf, sizeof(buf))) > 0) {
+        out.append(buf, n);
+    }
+    syscall(SYS_close, fd);
+    return n >= 0;
+}
 
 static bool is_region_strictly_rx(void* addr, size_t len) {
     if (!addr || len == 0) return false;
     uintptr_t start = (uintptr_t)addr;
     uintptr_t end = start + len;
 
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
+    std::string maps;
+    if (!read_proc_maps_syscall(maps)) return false;
 
-    char line[512];
+    std::istringstream stream(maps);
+    std::string line;
     bool valid = true;
-    while (fgets(line, sizeof(line), fp)) {
+    while (std::getline(stream, line)) {
         uintptr_t seg_start = 0, seg_end = 0;
         char perms[5] = {0};
-        if (sscanf(line, "%lx-%lx %4s", &seg_start, &seg_end, perms) != 3) continue;
-
+        if (sscanf(line.c_str(), "%lx-%lx %4s", &seg_start, &seg_end, perms) != 3) continue;
         if (seg_end <= start || seg_start >= end) continue;
-
         if (perms[0] != 'r' || perms[1] != '-' || perms[2] != 'x') {
             valid = false;
             break;
         }
     }
-    fclose(fp);
     return valid;
 }
 
 static bool is_system_critical_lib(void* target) {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
-    char line[512];
+    std::string maps;
+    if (!read_proc_maps_syscall(maps)) return false;
     uintptr_t addr = (uintptr_t)target;
-    bool is_critical = false;
-    while (fgets(line, sizeof(line), fp)) {
+    std::istringstream stream(maps);
+    std::string line;
+    const char* libdl_str = AY_OBFUSCATE("libdl.so");
+    const char* linker_str = AY_OBFUSCATE("linker64");
+    while (std::getline(stream, line)) {
         uintptr_t start, end;
-        if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+        if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
             if (addr >= start && addr < end) {
-                if (strstr(line, "libdl.so") || strstr(line, "linker64")) {
-                    is_critical = true;
+                if (line.find(libdl_str) != std::string::npos || line.find(linker_str) != std::string::npos) {
+                    return true;
                 }
                 break;
             }
         }
     }
-    fclose(fp);
-    return is_critical;
+    return false;
 }
 
 static bool is_executable_region(void* target) {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
-    char line[512];
+    std::string maps;
+    if (!read_proc_maps_syscall(maps)) return false;
     uintptr_t addr = (uintptr_t)target;
-    bool is_exec = false;
-    while (fgets(line, sizeof(line), fp)) {
+    std::istringstream stream(maps);
+    std::string line;
+    const char* rwx1 = AY_OBFUSCATE(" r-x ");
+    const char* rwx2 = AY_OBFUSCATE(" r-xp");
+    while (std::getline(stream, line)) {
         uintptr_t start, end;
-        if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+        if (sscanf(line.c_str(), "%lx-%lx", &start, &end) == 2) {
             if (addr >= start && addr < end) {
-                if (strstr(line, " r-x ") || strstr(line, " r-xp ") || strstr(line, " r-xp")) {
-                    is_exec = true;
+                if (line.find(rwx1) != std::string::npos || line.find(rwx2) != std::string::npos) {
+                    return true;
                 }
                 break;
             }
         }
     }
-    fclose(fp);
-    return is_exec;
+    return false;
 }
 
 // ============================================================================
-// SELinux & Anti-Tamper BYPASS: Dual Syscall Method
+// SELinux & Anti-Tamper BYPASS: Dual Syscall Method (Strings Ofuscados)
 // ============================================================================
 
 static bool write_mem_proc(void* addr, const void* data, size_t len) {
-    // Strategy A: /proc/self/mem
-    int fd = syscall(SYS_openat, AT_FDCWD, "/proc/self/mem", O_WRONLY | O_CLOEXEC, 0);
+    const char* mem_path = AY_OBFUSCATE("/proc/self/mem");
+    int fd = syscall(SYS_openat, AT_FDCWD, mem_path, O_WRONLY | O_CLOEXEC, 0);
     if (fd >= 0) {
         if (syscall(SYS_lseek, fd, (off_t)addr, SEEK_SET) == (off_t)addr) {
             if (syscall(SYS_write, fd, data, len) == (ssize_t)len) {
@@ -348,7 +405,6 @@ static bool write_mem_proc(void* addr, const void* data, size_t len) {
         syscall(SYS_close, fd);
     }
     
-    // Strategy B: process_vm_writev
     struct iovec local_iov;
     local_iov.iov_base = (void*)data;
     local_iov.iov_len = len;
@@ -387,6 +443,7 @@ typedef std::uintptr_t Address;
 #define HOOK_OUT_OF_RANGE 9
 #define HOOK_ERR_PAC 10
 #define HOOK_PENDING 11
+#define HOOK_PROTECTED 12 
 
 struct GOTHookEntry {
     void** slot;
@@ -472,10 +529,6 @@ struct Mem {
     static bool make_rx(void* addr, std::size_t len) {
         if (page_protect(addr, len, PROT_READ | PROT_EXEC)) return true;
         if (page_protect(addr, len, PROT_READ | PROT_EXEC | PROT_BTI)) return true;
-
-        if (!is_region_strictly_rx(addr, len)) {
-            return false;
-        }
 
         Address start = align_down(reinterpret_cast<Address>(addr));
         Address end = align_up(reinterpret_cast<Address>(addr) + len);
@@ -673,16 +726,18 @@ static bool got_hook_module(void* target, void* replacement, struct dl_phdr_info
     ElfW(Rela)* jmprel = nullptr;
     size_t pltrelsz = 0;
     ElfW(Sym)* dynsym = nullptr;
+    const char* strtab = nullptr;
 
     for (ElfW(Dyn)* d = dynamic; d->d_tag != DT_NULL; d++) {
         switch (d->d_tag) {
             case DT_JMPREL: jmprel = (ElfW(Rela)*)(load_bias + d->d_un.d_ptr); break;
             case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
             case DT_SYMTAB: dynsym = (ElfW(Sym)*)(load_bias + d->d_un.d_ptr); break;
+            case DT_STRTAB: strtab = (const char*)(load_bias + d->d_un.d_ptr); break;
         }
     }
 
-    if (!jmprel || !dynsym || pltrelsz == 0) return false;
+    if (!jmprel || !dynsym || !strtab || pltrelsz == 0) return false;
 
     size_t rel_count = pltrelsz / sizeof(ElfW(Rela));
     bool any = false;
@@ -693,17 +748,33 @@ static bool got_hook_module(void* target, void* replacement, struct dl_phdr_info
 
         size_t sym_idx = ELF64_R_SYM(rel->r_info);
         ElfW(Sym)* sym = &dynsym[sym_idx];
-        void* sym_addr = (void*)(load_bias + sym->st_value);
-
-        if (sym_addr == target) {
-            void* got_entry_addr = (void*)(load_bias + rel->r_offset);
-            if (Mem::make_rw(got_entry_addr, sizeof(void*))) {
-                void* orig = nullptr;
-                std::memcpy(&orig, got_entry_addr, sizeof(void*));
-                std::memcpy(got_entry_addr, &replacement, sizeof(void*));
-                Mem::flush_caches(got_entry_addr, sizeof(void*));
-                entries.push_back({(void**)got_entry_addr, orig});
-                any = true;
+        
+        if (sym->st_shndx == SHN_UNDEF) {
+            const char* sym_name = strtab + sym->st_name;
+            void* resolved_addr = dlsym(RTLD_DEFAULT, sym_name);
+            if (resolved_addr == target) {
+                void* got_entry_addr = (void*)(load_bias + rel->r_offset);
+                if (Mem::make_rw(got_entry_addr, sizeof(void*))) {
+                    void* orig = nullptr;
+                    std::memcpy(&orig, got_entry_addr, sizeof(void*));
+                    std::memcpy(got_entry_addr, &replacement, sizeof(void*));
+                    Mem::flush_caches(got_entry_addr, sizeof(void*));
+                    entries.push_back({(void**)got_entry_addr, orig});
+                    any = true;
+                }
+            }
+        } else {
+            void* sym_addr = (void*)(load_bias + sym->st_value);
+            if (sym_addr == target) {
+                void* got_entry_addr = (void*)(load_bias + rel->r_offset);
+                if (Mem::make_rw(got_entry_addr, sizeof(void*))) {
+                    void* orig = nullptr;
+                    std::memcpy(&orig, got_entry_addr, sizeof(void*));
+                    std::memcpy(got_entry_addr, &replacement, sizeof(void*));
+                    Mem::flush_caches(got_entry_addr, sizeof(void*));
+                    entries.push_back({(void**)got_entry_addr, orig});
+                    any = true;
+                }
             }
         }
     }
@@ -777,9 +848,25 @@ public:
         if (!target || !replacement) return HOOK_NULL_ARGS;
         if (hooks_.count(target)) return HOOK_ALREADY_HOOKED;
 
-        // --- SYSTEM CRITICAL LIB CHECK ---
+        if (g_cfi_bypass_failed || ProtectionDetector::has_cfi()) {
+            LOGW("[Hook] CFI active. Skipping Inline Hook for %p, trying GOT...", target);
+            std::vector<GOTHookEntry> got_entries;
+            if (GOTHookManager::install(target, replacement, got_entries)) {
+                Hook h;
+                h.target = target; h.replacement = replacement;
+                h.is_got_hook = true; h.got_entries = std::move(got_entries);
+                h.active = true;
+                hooks_.try_emplace(target, std::move(h));
+                if (original_out) *original_out = target;
+                LOGI("[Hook] GOT hook installed successfully for target=%p", target);
+                return HOOK_OK;
+            }
+            LOGE("[Hook] Target %p is CFI-protected and GOT failed.", target);
+            return HOOK_PROTECTED;
+        }
+
         if (is_system_critical_lib(target)) {
-            LOGW("[Hook] Target %p is in system critical lib, skipping inline hook, trying GOT fallback...", target);
+            LOGW("[Hook] Target %p is in system critical lib, trying GOT fallback...", target);
             std::vector<GOTHookEntry> got_entries;
             if (GOTHookManager::install(target, replacement, got_entries)) {
                 maybe_disable_cfi();
@@ -794,6 +881,24 @@ public:
             }
             LOGE("[Hook] GOT hook failed for critical lib target=%p", target);
             return HOOK_MPROTECT_FAILED;
+        }
+
+        if (!is_executable_region(target)) {
+            LOGW("[Hook] Target %p is not in executable memory. Trying GOT fallback...", target);
+            std::vector<GOTHookEntry> got_entries;
+            if (GOTHookManager::install(target, replacement, got_entries)) {
+                maybe_disable_cfi();
+                Hook h;
+                h.target = target; h.replacement = replacement;
+                h.is_got_hook = true; h.got_entries = std::move(got_entries);
+                h.active = true;
+                hooks_.try_emplace(target, std::move(h));
+                if (original_out) *original_out = target;
+                LOGI("[Hook] GOT hook installed successfully for non-exec target=%p", target);
+                return HOOK_OK;
+            }
+            LOGE("[Hook] Target %p is not executable and GOT hook failed.", target);
+            return HOOK_INVALID_TARGET;
         }
 
         ExecMemGuard tramp_guard(kTrampolineSize);
@@ -825,26 +930,33 @@ public:
                     atomic_write_inst(target, h.backup.data(), h.patch_size);
                     Mem::flush_caches(target, h.patch_size);
                     Mem::page_protect(target, h.patch_size, PROT_READ | PROT_EXEC);
-                    LOGW("[Hook] mprotect to RX failed. Falling back to /proc/self/mem.");
+                    LOGW("[Hook] mprotect to RX failed. Aborting Inline Hook.");
                 }
             }
 
             if (!patched) {
-                if (write_mem_proc(target, full_patch.data(), h.patch_size)) {
-                    Mem::flush_caches(target, h.patch_size);
-                    patched = true;
-                    LOGI("[Hook] Patched successfully via /proc/self/mem.");
+                LOGW("[Hook] Inline hook failed, attempting GOT hook fallback...");
+                std::vector<GOTHookEntry> got_entries;
+                if (GOTHookManager::install(target, replacement, got_entries)) {
+                    maybe_disable_cfi();
+                    Hook h_got;
+                    h_got.target = target; h_got.replacement = replacement;
+                    h_got.is_got_hook = true; h_got.got_entries = std::move(got_entries);
+                    h_got.active = true;
+                    hooks_.try_emplace(target, std::move(h_got));
+                    if (original_out) *original_out = target;
+                    LOGI("[Hook] GOT hook installed successfully for target=%p", target);
+                    return HOOK_OK;
                 }
-            }
-
-            if (!patched) {
-                LOGE("[Hook] Failed to patch target %p", target);
+                
+                LOGE("[Hook] Failed to patch target %p (Memory not executable and GOT failed)", target);
                 return HOOK_MPROTECT_FAILED;
             }
 
             if (!Mem::make_rx(tramp, kTrampolineSize)) {
-                write_mem_proc(target, h.backup.data(), h.patch_size);
+                atomic_write_inst(target, h.backup.data(), h.patch_size);
                 Mem::flush_caches(target, h.patch_size);
+                Mem::page_protect(target, h.patch_size, PROT_READ | PROT_EXEC);
                 return HOOK_MPROTECT_FAILED;
             }
 
@@ -880,7 +992,7 @@ public:
         if (hooks_.count(target)) return HOOK_ALREADY_HOOKED;
         if (original_out != nullptr) return install(target, replacement, original_out);
 
-        if (is_system_critical_lib(target) || !is_executable_region(target)) {
+        if (g_cfi_bypass_failed || is_system_critical_lib(target) || !is_executable_region(target)) {
             return install(target, replacement, original_out);
         }
 
@@ -902,13 +1014,6 @@ public:
                     atomic_write_inst(target, h.backup.data(), 4);
                     Mem::flush_caches(target, 4);
                     Mem::page_protect(target, 4, PROT_READ | PROT_EXEC);
-                }
-            }
-            if (!patched) {
-                if (write_mem_proc(target, &insn, 4)) {
-                    Mem::flush_caches(target, 4);
-                    patched = true;
-                    LOGI("[Hook] Single insn patched via /proc/self/mem.");
                 }
             }
             if (!patched) return HOOK_MPROTECT_FAILED;
@@ -933,12 +1038,6 @@ public:
                     atomic_write_inst(h.target, h.backup.data(), h.backup.size());
                     Mem::flush_caches(h.target, h.backup.size());
                     if (Mem::page_protect(h.target, h.backup.size(), h.rx_prot)) restored = true;
-                }
-                if (!restored) {
-                    if (write_mem_proc(h.target, h.backup.data(), h.backup.size())) {
-                        Mem::flush_caches(h.target, h.backup.size());
-                        restored = true;
-                    }
                 }
                 if (!restored) result = HOOK_MPROTECT_FAILED;
             }
@@ -1023,11 +1122,15 @@ static void init_dlopen_monitor() {
     void* dlopen_addr = nullptr;
     void* android_dlopen_ext_addr = nullptr;
 
-    void* libdl = xdl_open("libdl.so", XDL_DEFAULT);
+    const char* libdl_name = AY_OBFUSCATE("libdl.so");
+    const char* dlopen_name = AY_OBFUSCATE("dlopen");
+    const char* dlopen_ext_name = AY_OBFUSCATE("android_dlopen_ext");
+
+    void* libdl = xdl_open(libdl_name, XDL_DEFAULT);
     if (libdl) {
-        dlopen_addr = xdl_sym(libdl, "dlopen", nullptr);
+        dlopen_addr = xdl_sym(libdl, dlopen_name, nullptr);
 #if defined(__ANDROID_API__) && __ANDROID_API__ >= 21
-        android_dlopen_ext_addr = xdl_sym(libdl, "android_dlopen_ext", nullptr);
+        android_dlopen_ext_addr = xdl_sym(libdl, dlopen_ext_name, nullptr);
 #endif
         xdl_close(libdl);
     }
@@ -1041,6 +1144,7 @@ static void init_dlopen_monitor() {
         } else {
             LOGW("[Pending] Inline dlopen hook failed (%d), trying GOT fallback...", err);
             if (got_hook_all_modules(dlopen_addr, (void*)hooked_dlopen, g_dlopen_got_entries)) {
+                orig_dlopen_ptr = (void*)dlopen_addr;
                 LOGI("[Pending] dlopen GOT monitor installed (%zu entries).", g_dlopen_got_entries.size());
             }
         }
@@ -1057,6 +1161,7 @@ static void init_dlopen_monitor() {
             LOGW("[Pending] Inline android_dlopen_ext hook failed (%d), trying GOT fallback...", err);
             std::vector<GOTHookEntry> entries;
             if (got_hook_all_modules(android_dlopen_ext_addr, (void*)hooked_android_dlopen_ext, entries)) {
+                orig_android_dlopen_ext_ptr = (void*)android_dlopen_ext_addr;
                 LOGI("[Pending] android_dlopen_ext GOT monitor installed (%zu entries).", entries.size());
             }
         }
@@ -1065,6 +1170,10 @@ static void init_dlopen_monitor() {
 }
 
 } // namespace sandhook
+
+// ============================================================================
+// PUBLIC C API
+// ============================================================================
 
 extern "C" {
 
@@ -1093,7 +1202,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-4.8";
+    return "sandhook-arm64-production-5.6";
 }
 
 const char* sandhook_error_string(int err) {
@@ -1109,6 +1218,7 @@ const char* sandhook_error_string(int err) {
         case HOOK_OUT_OF_RANGE: return "OUT_OF_RANGE";
         case HOOK_ERR_PAC: return "PAC_FAILED";
         case HOOK_PENDING: return "PENDING (Lib not loaded yet)";
+        case HOOK_PROTECTED: return "PROTECTED (CFI/SELinux active)";
         default: return "UNKNOWN_ERROR";
     }
 }
@@ -1122,26 +1232,21 @@ int sandhook_install_pending(const char* lib_name, const char* sym_name, void* r
         if (!target) target = xdl_dsym(handle, sym_name, nullptr);
         xdl_close(handle);
         if (target) {
-            // La librería ya está cargada, hookear inmediatamente
             return sandhook_install_ex(target, replacement, original_out);
         }
     }
 
-    // Si llegamos aquí, la librería o el símbolo no existen en memoria aún.
     {
         std::lock_guard<std::mutex> lk(sandhook::g_pending_mu);
         for (const auto& p : sandhook::g_pending_hooks) {
             if (p.lib_name == lib_name && p.sym_name == sym_name) {
-                return HOOK_ALREADY_HOOKED; // Ya estaba en la cola de pendientes
+                return HOOK_ALREADY_HOOKED;
             }
         }
         sandhook::g_pending_hooks.push_back({lib_name, sym_name, replacement, original_out});
     }
 
-    // Iniciar el monitor de dlopen por si aún no estaba iniciado
     sandhook::init_dlopen_monitor();
-    
-    // Devolvemos HOOK_PENDING para que el reverser sepa que está en cola
     return HOOK_PENDING;
 }
 
