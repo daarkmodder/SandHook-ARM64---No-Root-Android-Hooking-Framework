@@ -1,6 +1,8 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
-// Version: 4.8 (Exec Mem Check + Dual Syscall Write Bypass)
+// Version: 4.8 (Exec Mem Check + Dual Syscall Write Bypass) + New Message (PENDING)
+
+// Created by daarkmodder on 2026-07-19.
 
 #include <cstdint>
 #include <cstddef>
@@ -383,6 +385,8 @@ typedef std::uintptr_t Address;
 #define HOOK_BOUNDS_EXCEEDED 7
 #define HOOK_THREAD_SUSPENSION_FAILED 8
 #define HOOK_OUT_OF_RANGE 9
+#define HOOK_ERR_PAC 10
+#define HOOK_PENDING 11
 
 struct GOTHookEntry {
     void** slot;
@@ -1122,6 +1126,8 @@ const char* sandhook_error_string(int err) {
         case HOOK_INVALID_TARGET: return "INVALID_TARGET";
         case HOOK_BOUNDS_EXCEEDED: return "BOUNDS_EXCEEDED";
         case HOOK_OUT_OF_RANGE: return "OUT_OF_RANGE";
+        case HOOK_ERR_PAC: return "PAC_FAILED";
+        case HOOK_PENDING: return "PENDING (Lib not loaded yet)";
         default: return "UNKNOWN_ERROR";
     }
 }
@@ -1135,22 +1141,27 @@ int sandhook_install_pending(const char* lib_name, const char* sym_name, void* r
         if (!target) target = xdl_dsym(handle, sym_name, nullptr);
         xdl_close(handle);
         if (target) {
+            // La librería ya está cargada, hookear inmediatamente
             return sandhook_install_ex(target, replacement, original_out);
         }
     }
 
+    // Si llegamos aquí, la librería o el símbolo no existen en memoria aún.
     {
         std::lock_guard<std::mutex> lk(sandhook::g_pending_mu);
         for (const auto& p : sandhook::g_pending_hooks) {
             if (p.lib_name == lib_name && p.sym_name == sym_name) {
-                return HOOK_ALREADY_HOOKED;
+                return HOOK_ALREADY_HOOKED; // Ya estaba en la cola de pendientes
             }
         }
         sandhook::g_pending_hooks.push_back({lib_name, sym_name, replacement, original_out});
     }
 
+    // Iniciar el monitor de dlopen por si aún no estaba iniciado
     sandhook::init_dlopen_monitor();
-    return HOOK_OK;
+    
+    // Devolvemos HOOK_PENDING para que el reverser sepa que está en cola
+    return HOOK_PENDING;
 }
 
 } // extern "C"
