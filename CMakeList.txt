@@ -2,28 +2,42 @@
 # Build script for SandHook ARM64 Production Framework
 
 cmake_minimum_required(VERSION 3.10.2)
-project(sandhook LANGUAGES CXX)
+project(sandhook LANGUAGES C CXX) # Añadimos C porque xDL está en C puro
 
 # Force ARM64 architecture
 if(NOT ANDROID_ABI STREQUAL "arm64-v8a")
     message(FATAL_ERROR "SandHook only supports arm64-v8a architecture.")
 endif()
 
-# Set C++ standard and flags
+# Set C++ and C standards
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+
+# Archivos fuente de xDL
+set(XDL_SOURCES
+    xdl/xdl.c
+    xdl/xdl_iterate.c
+    xdl/xdl_linker.c
+    xdl/xdl_lzma.c
+    xdl/xdl_util.c
+)
 
 # Add the SandHook shared library (libsandhook.so)
 add_library(sandhook SHARED
     src/sandhook.cpp
     src/art_hook.cpp
     src/sandhook_jni.cpp
+    ${XDL_SOURCES}
 )
 
 # Include directories
-target_include_directories(sandhook PRIVATE src)
+target_include_directories(sandhook PRIVATE 
+    src 
+    xdl
+)
 
-# Compiler options for production (size optimized, no RTTI/Exceptions)
+# Compiler options for production
 target_compile_options(sandhook PRIVATE
     -O2
     -fno-exceptions
@@ -36,5 +50,5 @@ target_compile_options(sandhook PRIVATE
 # Link required Android libraries
 target_link_libraries(sandhook
     log    # For __android_log_print
-    dl     # For dlopen/dlsym in art_hook.cpp
+    dl     # For dlopen/dlsym fallbacks
 )

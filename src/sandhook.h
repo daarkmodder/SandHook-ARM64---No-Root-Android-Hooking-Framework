@@ -1,4 +1,7 @@
 // sandhook.h
+// Production-Grade ARM64 Hook Framework for Android (No-Root)
+// Version: 4.8
+
 #pragma once
 
 #include <stdint.h>
@@ -18,15 +21,18 @@ extern "C" {
 #define HOOK_BOUNDS_EXCEEDED        7
 #define HOOK_THREAD_SUSPENSION_FAILED 8
 #define HOOK_OUT_OF_RANGE           9
-#define HOOK_ERR_PAC                10 // Nuevo: Fallo de autenticación de puntero
+#define HOOK_ERR_PAC                10 // Fallo de autenticación de puntero
 
 int sandhook_install_ex(void* target, void* replacement, void** original_out);
 void* sandhook_install(void* target, void* replacement, void** original_out);
 int sandhook_install_single_insn(void* target, void* replacement, void** original_out);
 int sandhook_remove(void* target);
 void* sandhook_trampoline(void* target);
+
+// Utility & Pending Hooks
 const char* sandhook_version();
 const char* sandhook_error_string(int err);
+int sandhook_install_pending(const char* lib_name, const char* sym_name, void* replacement, void** original_out);
 
 #ifdef __cplusplus
 }
