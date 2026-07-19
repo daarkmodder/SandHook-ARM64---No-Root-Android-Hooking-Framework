@@ -796,25 +796,6 @@ public:
             return HOOK_MPROTECT_FAILED;
         }
 
-        // --- NON-EXECUTABLE MEMORY CHECK (PairIP Bypass) ---
-        if (!is_executable_region(target)) {
-            LOGW("[Hook] Target %p is not in executable memory (r-x). Trying GOT fallback...", target);
-            std::vector<GOTHookEntry> got_entries;
-            if (GOTHookManager::install(target, replacement, got_entries)) {
-                maybe_disable_cfi();
-                Hook h;
-                h.target = target; h.replacement = replacement;
-                h.is_got_hook = true; h.got_entries = std::move(got_entries);
-                h.active = true;
-                hooks_.try_emplace(target, std::move(h));
-                if (original_out) *original_out = target;
-                LOGI("[Hook] GOT hook installed successfully for non-exec target=%p", target);
-                return HOOK_OK;
-            }
-            LOGE("[Hook] GOT hook failed for non-exec target=%p", target);
-            return HOOK_INVALID_TARGET;
-        }
-
         ExecMemGuard tramp_guard(kTrampolineSize);
         void* tramp = tramp_guard.get();
         if (!tramp) return HOOK_ALLOC_FAILED;
