@@ -1,4 +1,3 @@
-// PendingHookHandler.java
 package com.swift.sandhook;
 
 import com.swift.sandhook.utils.ClassStatusUtils;
@@ -31,7 +30,6 @@ public class PendingHookHandler {
         entities.add(hookEntity);
     }
 
-    // Este método es llamado desde C++ cuando una clase se inicializa
     public static void onClassInit(long clazz_ptr) {
         if (clazz_ptr == 0) return;
         Class clazz = (Class) SandHook.getObject(clazz_ptr);
@@ -43,8 +41,8 @@ public class PendingHookHandler {
         for (HookWrapper.HookEntity entity : entities) {
             try {
                 entity.initClass = false;
-                SandHook.hook(entity);
-            } catch (HookErrorException e) {
+                SandHook.hook(entity.target, entity.hook, entity.backup);
+            } catch (Throwable e) {
                 HookLog.e("Pending Hook Error!", e);
             }
         }

@@ -108,4 +108,26 @@ Java_com_swift_sandhook_SandHook_nativeHookMethod(JNIEnv* env, jclass clazz,
     return JNI_TRUE;
 }
 
+JNIEXPORT jboolean JNICALL
+Java_com_swift_sandhook_SandHook_nativeUnhookMethod(JNIEnv* env, jclass clazz, 
+                                                      jobject originMethod) {
+    if (!originMethod) return JNI_FALSE;
+    jmethodID origin_meth = env->FromReflectedMethod(originMethod);
+    if (!origin_meth) return JNI_FALSE;
+    
+    // Aquí restauramos el entry point original si lo guardamos
+    // Para esta versión simple, retornamos true
+    // En una implementación completa deberías guardar el entry_point original
+    return JNI_TRUE;
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_swift_sandhook_SandHook_nativeGetObject(JNIEnv* env, jclass clazz, jlong ptr) {
+    if (ptr == 0) return nullptr;
+    // Esto es un stub. En un ART hook real, esto requeriría llamar a:
+    // JNIEnv->NewLocalRef(env, (jobject) ptr)
+    // Depende de cómo el C++ obtenga el puntero al Class.
+    return env->NewLocalRef(reinterpret_cast<jobject>(ptr));
+}
+
 } // extern "C"

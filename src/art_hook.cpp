@@ -8,13 +8,13 @@
 #include <string>
 #include <sstream>
 #include <fstream>
+#include "xdl/xdl.h"
 
 #define LOG_TAG "SandHook-ART"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
-// Declaración de la función ensambladora externa
 extern "C" void sandhook_art_quick_stub();
 
 namespace sandhook {
@@ -31,19 +31,28 @@ namespace sandhook {
             sdk_int = env->GetStaticIntField(versionClass, sdkIntField);
             env->DeleteLocalRef(versionClass);
 
-            // 1. Cargar libart.so y obtener el puente del intérprete
-            void* libart = dlopen("libart.so", RTLD_NOW);
+            // 1. Cargar libart.so usando xDL
+            void* libart = xdl_open("libart.so", XDL_DEFAULT);
             if (!libart) {
-                LOGE("Failed to load libart.so");
+                LOGE("Failed to load libart.so via xdl");
                 return;
             }
 
-            void* interpreter_bridge = dlsym(libart, "art_quick_to_interpreter_bridge");
+            // Intentar buscar el símbolo en la tabla dinámica y estática
+            void* interpreter_bridge = xdl_sym(libart, "art_quick_to_interpreter_bridge", nullptr);
+            if (!interpreter_bridge) {
+                LOGW("Symbol not in .dynsym. Trying hidden .symtab via xdl_dsym...");
+                interpreter_bridge = xdl_dsym(libart, "art_quick_to_interpreter_bridge", nullptr);
+            }
+
             if (!interpreter_bridge) {
                 LOGW("Could not find art_quick_to_interpreter_bridge. Using fallback offset 24.");
-                entry_point_offset = 24; // Fallback Android 9+
+                entry_point_offset = 24; 
+                xdl_close(libart);
                 return;
             }
+
+            LOGI("Successfully found art_quick_to_interpreter_bridge via xDL!");
 
             // 2. Obtener un ArtMethod conocido (Object.hashCode)
             jclass objClass = env->FindClass("java/lang/Object");
@@ -53,14 +62,14 @@ namespace sandhook {
             if (!dummy_method) {
                 LOGE("Failed to get dummy method for offset calculation.");
                 entry_point_offset = 24;
+                xdl_close(libart);
                 return;
             }
 
-            // 3. Calcular offset dinámicamente escaneando la estructura ArtMethod
+            // 3. Calcular offset dinámicamente
             uintptr_t art_method_ptr = reinterpret_cast<uintptr_t>(dummy_method);
             entry_point_offset = 0;
             
-            // El ArtMethod suele medir 32 o 40 bytes. Escaneamos los primeros 64 bytes.
             for (size_t i = 0; i < 64; i += sizeof(void*)) {
                 void* val = *reinterpret_cast<void**>(art_method_ptr + i);
                 if (val == interpreter_bridge) {
@@ -75,15 +84,15 @@ namespace sandhook {
             } else {
                 LOGI("Dynamic ArtMethod offset found successfully: %zu", entry_point_offset);
             }
+            
+            xdl_close(libart);
         }
 
         void* pac_strip(void* addr) {
             if (!addr) return nullptr;
 #if defined(__aarch64__)
-            // En Android 13+ (ARM64 v8.3+), los punteros pueden tener firmas PAC.
-            // Limpiamos los bits superiores para obtener la dirección real.
             uintptr_t val = reinterpret_cast<uintptr_t>(addr);
-            val &= 0x0000FFFFFFFFFFFFULL; // Máscara de 48 bits para espacio de usuario
+            val &= 0x0000FFFFFFFFFFFFULL;
             return reinterpret_cast<void*>(val);
 #else
             return addr;
