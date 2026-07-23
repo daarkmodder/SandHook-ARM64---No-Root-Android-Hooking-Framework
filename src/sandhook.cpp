@@ -1,6 +1,6 @@
 // sandhook_production.cpp
 // Production-Grade ARM64 Hook Framework for Android (No-Root)
-// Version: 5.6 (Obfuscated Strings + Protection Aware + Safe GOT Fallback)
+// Version: 5.7 (Obfuscated Strings + Protection Aware + Safe GOT Fallback + Enhanced GOT + RET Patch)
 
 #include <cstdint>
 #include <cstddef>
@@ -708,7 +708,125 @@ struct Relocator {
 };
 
 // ============================================================================
-// GOT HOOKING FALLBACK
+// RET PATCH FALLBACK (Neutralize function by writing RET at prologue)
+// ============================================================================
+
+#if defined(__aarch64__)
+#define ARM64_RET_INSN 0xD65F03C0
+#endif
+
+struct RetPatchEntry {
+    void* target;
+    std::vector<uint8_t> backup;
+};
+
+static std::vector<RetPatchEntry> g_ret_patches;
+static std::mutex g_ret_patch_mu;
+
+static bool install_ret_patch(void* target, int64_t return_value_x0 = 0, bool set_x0 = false) {
+    if (!target) return false;
+
+    if (!is_executable_region(target)) {
+        LOGW("[RetPatch] Target %p no es ejecutable.", target);
+        return false;
+    }
+
+    if (is_system_critical_lib(target)) {
+        LOGW("[RetPatch] Target %p es lib crítica, abortando.", target);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(g_ret_patch_mu);
+
+    for (auto& e : g_ret_patches) {
+        if (e.target == target) return true;
+    }
+
+    size_t patch_size = set_x0 ? 20 : 4;
+    RetPatchEntry entry;
+    entry.target = target;
+    entry.backup.resize(patch_size);
+    
+    {
+        SigGuard guard((uintptr_t)target, (uintptr_t)target + patch_size);
+        if (guard.jumped()) {
+            LOGE("[RetPatch] SIGSEGV leyendo target %p", target);
+            return false;
+        }
+        std::memcpy(entry.backup.data(), target, patch_size);
+    }
+
+    std::vector<uint8_t> patch(patch_size, 0);
+    if (set_x0) {
+        uint8_t* p = patch.data();
+        uint32_t movz = 0xD2800000 | ((return_value_x0 & 0xFFFF) << 5);
+        std::memcpy(p, &movz, 4); p += 4;
+        uint32_t movk1 = 0xF2A00000 | (((return_value_x0 >> 16) & 0xFFFF) << 5);
+        std::memcpy(p, &movk1, 4); p += 4;
+        uint32_t movk2 = 0xF2C00000 | (((return_value_x0 >> 32) & 0xFFFF) << 5);
+        std::memcpy(p, &movk2, 4); p += 4;
+        uint32_t movk3 = 0xF2E00000 | (((return_value_x0 >> 48) & 0xFFFF) << 5);
+        std::memcpy(p, &movk3, 4); p += 4;
+        uint32_t ret = ARM64_RET_INSN;
+        std::memcpy(p, &ret, 4);
+    } else {
+        uint32_t ret = ARM64_RET_INSN;
+        std::memcpy(patch.data(), &ret, 4);
+    }
+
+    bool patched = false;
+    if (Mem::make_rw(target, patch_size)) {
+        atomic_write_inst(target, patch.data(), patch_size);
+        Mem::flush_caches(target, patch_size);
+        if (Mem::make_rx(target, patch_size)) {
+            patched = true;
+        } else {
+            atomic_write_inst(target, entry.backup.data(), patch_size);
+            Mem::flush_caches(target, patch_size);
+            Mem::page_protect(target, patch_size, PROT_READ | PROT_EXEC);
+        }
+    }
+
+    if (!patched) {
+        if (write_mem_proc(target, patch.data(), patch_size)) {
+            Mem::flush_caches(target, patch_size);
+            patched = true;
+        }
+    }
+
+    if (patched) {
+        g_ret_patches.push_back(std::move(entry));
+        LOGI("[RetPatch] Parche RET instalado en %p (size=%zu, set_x0=%d, val=0x%llx)", 
+             target, patch_size, set_x0, (unsigned long long)return_value_x0);
+        return true;
+    }
+
+    LOGE("[RetPatch] Falló la escritura en %p", target);
+    return false;
+}
+
+static bool remove_ret_patch(void* target) {
+    std::lock_guard<std::mutex> lk(g_ret_patch_mu);
+    for (auto it = g_ret_patches.begin(); it != g_ret_patches.end(); ++it) {
+        if (it->target == target) {
+            if (Mem::make_rw(it->target, it->backup.size())) {
+                atomic_write_inst(it->target, it->backup.data(), it->backup.size());
+                Mem::flush_caches(it->target, it->backup.size());
+                Mem::page_protect(it->target, it->backup.size(), PROT_READ | PROT_EXEC);
+            } else {
+                write_mem_proc(it->target, it->backup.data(), it->backup.size());
+                Mem::flush_caches(it->target, it->backup.size());
+            }
+            g_ret_patches.erase(it);
+            LOGI("[RetPatch] Parche removido de %p", target);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// ENHANCED GOT HOOKING (Scan .rela.plt AND .rela.dyn)
 // ============================================================================
 
 static bool got_hook_module(void* target, void* replacement, struct dl_phdr_info* info, std::vector<GOTHookEntry>& entries) {
@@ -723,61 +841,87 @@ static bool got_hook_module(void* target, void* replacement, struct dl_phdr_info
     }
     if (!dynamic) return false;
 
-    ElfW(Rela)* jmprel = nullptr;
+    ElfW(Rela)* jmprel = nullptr;   // .rela.plt
+    ElfW(Rela)* reladata = nullptr; // .rela.dyn
     size_t pltrelsz = 0;
+    size_t relasz = 0;
     ElfW(Sym)* dynsym = nullptr;
     const char* strtab = nullptr;
 
     for (ElfW(Dyn)* d = dynamic; d->d_tag != DT_NULL; d++) {
         switch (d->d_tag) {
-            case DT_JMPREL: jmprel = (ElfW(Rela)*)(load_bias + d->d_un.d_ptr); break;
+            case DT_JMPREL:   jmprel   = (ElfW(Rela)*)(load_bias + d->d_un.d_ptr); break;
             case DT_PLTRELSZ: pltrelsz = d->d_un.d_val; break;
-            case DT_SYMTAB: dynsym = (ElfW(Sym)*)(load_bias + d->d_un.d_ptr); break;
-            case DT_STRTAB: strtab = (const char*)(load_bias + d->d_un.d_ptr); break;
+            case DT_RELA:     reladata = (ElfW(Rela)*)(load_bias + d->d_un.d_ptr); break;
+            case DT_RELASZ:   relasz   = d->d_un.d_val; break;
+            case DT_SYMTAB:   dynsym   = (ElfW(Sym)*)(load_bias + d->d_un.d_ptr); break;
+            case DT_STRTAB:   strtab   = (const char*)(load_bias + d->d_un.d_ptr); break;
         }
     }
 
-    if (!jmprel || !dynsym || !strtab || pltrelsz == 0) return false;
+    if (!dynsym || !strtab) return false;
 
-    size_t rel_count = pltrelsz / sizeof(ElfW(Rela));
     bool any = false;
 
-    for (size_t i = 0; i < rel_count; i++) {
-        ElfW(Rela)* rel = &jmprel[i];
-        if (ELF64_R_TYPE(rel->r_info) != R_AARCH64_JUMP_SLOT) continue;
-
-        size_t sym_idx = ELF64_R_SYM(rel->r_info);
-        ElfW(Sym)* sym = &dynsym[sym_idx];
+    auto process_rela_table = [&](ElfW(Rela)* table, size_t table_size, bool is_jmp_slot) {
+        if (!table || table_size == 0) return;
         
-        if (sym->st_shndx == SHN_UNDEF) {
-            const char* sym_name = strtab + sym->st_name;
-            void* resolved_addr = dlsym(RTLD_DEFAULT, sym_name);
-            if (resolved_addr == target) {
-                void* got_entry_addr = (void*)(load_bias + rel->r_offset);
-                if (Mem::make_rw(got_entry_addr, sizeof(void*))) {
-                    void* orig = nullptr;
-                    std::memcpy(&orig, got_entry_addr, sizeof(void*));
-                    std::memcpy(got_entry_addr, &replacement, sizeof(void*));
-                    Mem::flush_caches(got_entry_addr, sizeof(void*));
-                    entries.push_back({(void**)got_entry_addr, orig});
-                    any = true;
+        size_t count = table_size / sizeof(ElfW(Rela));
+        for (size_t i = 0; i < count; i++) {
+            ElfW(Rela)* rel = &table[i];
+            uint32_t r_type = ELF64_R_TYPE(rel->r_info);
+            
+            bool valid_type = is_jmp_slot 
+                ? (r_type == R_AARCH64_JUMP_SLOT)
+                : (r_type == R_AARCH64_GLOB_DAT);
+            
+            if (!valid_type) continue;
+
+            size_t sym_idx = ELF64_R_SYM(rel->r_info);
+            ElfW(Sym)* sym = &dynsym[sym_idx];
+            void* got_entry_addr = (void*)(load_bias + rel->r_offset);
+            
+            void* current_val = nullptr;
+            {
+                SigGuard guard((uintptr_t)got_entry_addr, (uintptr_t)got_entry_addr + sizeof(void*));
+                if (guard.jumped()) continue;
+                std::memcpy(&current_val, got_entry_addr, sizeof(void*));
+            }
+            
+            bool match = false;
+            if (current_val == target) {
+                match = true;
+            } else if (sym->st_shndx == SHN_UNDEF) {
+                const char* sym_name = strtab + sym->st_name;
+                void* resolved = dlsym(RTLD_DEFAULT, sym_name);
+                if (resolved == target) {
+                    match = true;
+                }
+            } else {
+                void* sym_addr = (void*)(load_bias + sym->st_value);
+                if (sym_addr == target) {
+                    match = true;
                 }
             }
-        } else {
-            void* sym_addr = (void*)(load_bias + sym->st_value);
-            if (sym_addr == target) {
-                void* got_entry_addr = (void*)(load_bias + rel->r_offset);
-                if (Mem::make_rw(got_entry_addr, sizeof(void*))) {
-                    void* orig = nullptr;
-                    std::memcpy(&orig, got_entry_addr, sizeof(void*));
-                    std::memcpy(got_entry_addr, &replacement, sizeof(void*));
-                    Mem::flush_caches(got_entry_addr, sizeof(void*));
-                    entries.push_back({(void**)got_entry_addr, orig});
-                    any = true;
-                }
+            
+            if (!match) continue;
+            
+            if (Mem::make_rw(got_entry_addr, sizeof(void*))) {
+                void* orig = nullptr;
+                std::memcpy(&orig, got_entry_addr, sizeof(void*));
+                std::memcpy(got_entry_addr, &replacement, sizeof(void*));
+                Mem::flush_caches(got_entry_addr, sizeof(void*));
+                entries.push_back({(void**)got_entry_addr, orig});
+                any = true;
+                LOGI("[GOT-Enhanced] Hook en %p (GOT entry %p, type=%s)", 
+                     target, got_entry_addr, is_jmp_slot ? "JUMP_SLOT" : "GLOB_DAT");
             }
         }
-    }
+    };
+
+    process_rela_table(jmprel, pltrelsz, true);
+    process_rela_table(reladata, relasz, false);
+
     return any;
 }
 
@@ -834,6 +978,7 @@ struct Hook {
     void* target = nullptr; void* replacement = nullptr; void* trampoline = nullptr;
     std::size_t patch_size = 0; std::size_t tramp_size = 0; std::vector<std::uint8_t> backup;
     bool active = false; bool is_single_insn = false; bool is_got_hook = false;
+    bool is_ret_patch = false; // NUEVO
     std::vector<GOTHookEntry> got_entries;
     int rx_prot = PROT_READ | PROT_EXEC;
 };
@@ -861,7 +1006,19 @@ public:
                 LOGI("[Hook] GOT hook installed successfully for target=%p", target);
                 return HOOK_OK;
             }
-            LOGE("[Hook] Target %p is CFI-protected and GOT failed.", target);
+            
+            LOGW("[Hook] GOT failed. Attempting RET Patch fallback for %p", target);
+            if (install_ret_patch(target, 0, false)) {
+                Hook h;
+                h.target = target; h.replacement = replacement;
+                h.is_ret_patch = true; h.active = true;
+                hooks_.try_emplace(target, std::move(h));
+                if (original_out) *original_out = nullptr;
+                LOGI("[Hook] Fallback RET patch installed for %p", target);
+                return HOOK_OK;
+            }
+
+            LOGE("[Hook] Target %p is CFI-protected and GOT/RET failed.", target);
             return HOOK_PROTECTED;
         }
 
@@ -879,6 +1036,18 @@ public:
                 LOGI("[Hook] GOT hook installed successfully for target=%p", target);
                 return HOOK_OK;
             }
+            
+            LOGW("[Hook] Critical GOT failed. Attempting RET Patch fallback for %p", target);
+            if (install_ret_patch(target, 0, false)) {
+                Hook h;
+                h.target = target; h.replacement = replacement;
+                h.is_ret_patch = true; h.active = true;
+                hooks_.try_emplace(target, std::move(h));
+                if (original_out) *original_out = nullptr;
+                LOGI("[Hook] Fallback RET patch installed for %p", target);
+                return HOOK_OK;
+            }
+
             LOGE("[Hook] GOT hook failed for critical lib target=%p", target);
             return HOOK_MPROTECT_FAILED;
         }
@@ -897,7 +1066,19 @@ public:
                 LOGI("[Hook] GOT hook installed successfully for non-exec target=%p", target);
                 return HOOK_OK;
             }
-            LOGE("[Hook] Target %p is not executable and GOT hook failed.", target);
+
+            LOGW("[Hook] Non-exec GOT failed. Attempting RET Patch fallback for %p", target);
+            if (install_ret_patch(target, 0, false)) {
+                Hook h;
+                h.target = target; h.replacement = replacement;
+                h.is_ret_patch = true; h.active = true;
+                hooks_.try_emplace(target, std::move(h));
+                if (original_out) *original_out = nullptr;
+                LOGI("[Hook] Fallback RET patch installed for %p", target);
+                return HOOK_OK;
+            }
+
+            LOGE("[Hook] Target %p is not executable and GOT/RET failed.", target);
             return HOOK_INVALID_TARGET;
         }
 
@@ -949,7 +1130,18 @@ public:
                     return HOOK_OK;
                 }
                 
-                LOGE("[Hook] Failed to patch target %p (Memory not executable and GOT failed)", target);
+                LOGW("[Hook] GOT failed. Attempting RET Patch fallback for %p", target);
+                if (install_ret_patch(target, 0, false)) {
+                    Hook h_ret;
+                    h_ret.target = target; h_ret.replacement = replacement;
+                    h_ret.is_ret_patch = true; h_ret.active = true;
+                    hooks_.try_emplace(target, std::move(h_ret));
+                    if (original_out) *original_out = nullptr;
+                    LOGI("[Hook] Fallback RET patch installed for %p", target);
+                    return HOOK_OK;
+                }
+
+                LOGE("[Hook] Failed to patch target %p (Memory not executable and GOT/RET failed)", target);
                 return HOOK_MPROTECT_FAILED;
             }
 
@@ -979,6 +1171,17 @@ public:
             hooks_.try_emplace(target, std::move(h));
             if (original_out) *original_out = target;
             LOGI("[Hook] GOT hook installed successfully for target=%p", target);
+            return HOOK_OK;
+        }
+
+        LOGW("[Hook] Relocator GOT failed. Attempting RET Patch fallback for %p", target);
+        if (install_ret_patch(target, 0, false)) {
+            Hook h;
+            h.target = target; h.replacement = replacement;
+            h.is_ret_patch = true; h.active = true;
+            hooks_.try_emplace(target, std::move(h));
+            if (original_out) *original_out = nullptr;
+            LOGI("[Hook] Fallback RET patch installed for %p", target);
             return HOOK_OK;
         }
 
@@ -1032,6 +1235,8 @@ public:
         if (h.active && h.target) {
             if (h.is_got_hook) {
                 GOTHookManager::remove(h.got_entries);
+            } else if (h.is_ret_patch) {
+                remove_ret_patch(h.target);
             } else if (!h.backup.empty()) {
                 bool restored = false;
                 if (Mem::make_rw(h.target, h.backup.size())) {
@@ -1043,7 +1248,7 @@ public:
             }
             h.active = false;
         }
-        if (h.trampoline && !h.is_got_hook && !h.is_single_insn) syscall(SYS_munmap, h.trampoline, kTrampolineSize);
+        if (h.trampoline && !h.is_got_hook && !h.is_single_insn && !h.is_ret_patch) syscall(SYS_munmap, h.trampoline, kTrampolineSize);
         hooks_.erase(it);
         maybe_restore_cfi();
         return result;
@@ -1202,7 +1407,7 @@ void* sandhook_trampoline(void* target) {
 }
 
 const char* sandhook_version() {
-    return "sandhook-arm64-production-5.6";
+    return "sandhook-arm64-production-5.7";
 }
 
 const char* sandhook_error_string(int err) {
@@ -1248,6 +1453,12 @@ int sandhook_install_pending(const char* lib_name, const char* sym_name, void* r
 
     sandhook::init_dlopen_monitor();
     return HOOK_PENDING;
+}
+
+// Nueva API para forzar el RET patch con un valor de retorno específico
+int sandhook_ret_patch(void* target, int64_t return_value, int use_return_value) {
+    sandhook::init_dlopen_monitor();
+    return sandhook::install_ret_patch(target, return_value, use_return_value != 0) ? HOOK_OK : HOOK_PROTECTED;
 }
 
 } // extern "C"

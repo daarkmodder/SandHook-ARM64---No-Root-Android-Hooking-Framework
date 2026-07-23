@@ -20,6 +20,7 @@ extern "C" {
 #define HOOK_OUT_OF_RANGE           9
 #define HOOK_ERR_PAC                10
 #define HOOK_PENDING                11
+#define HOOK_PROTECTED              12 // <-- Agregado
 
 int sandhook_install_ex(void* target, void* replacement, void** original_out);
 void* sandhook_install(void* target, void* replacement, void** original_out);
@@ -30,6 +31,11 @@ void* sandhook_trampoline(void* target);
 const char* sandhook_version();
 const char* sandhook_error_string(int err);
 int sandhook_install_pending(const char* lib_name, const char* sym_name, void* replacement, void** original_out);
+
+// NUEVA API: Neutraliza una función escribiendo RET.
+// return_value: valor a cargar en x0 (ej. 0x00010006 para JNI_OnLoad).
+// use_return_value: 1 para inyectar el valor en x0, 0 para solo RET.
+int sandhook_ret_patch(void* target, int64_t return_value, int use_return_value);
 
 #ifdef __cplusplus
 }
