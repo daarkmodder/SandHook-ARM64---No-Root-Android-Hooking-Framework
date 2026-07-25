@@ -7,7 +7,7 @@ Este proyecto es el resultado de una fusión manual y depuración exhaustiva de 
 > ⚠️ **Aviso de Compatibilidad:** 
 > Este framework está escrito y optimizado estrictamente para **C++ y Ensamblador (ARM64)**. Re compilación con `clang++` y la librería estándar de C++.
 
-**Versión:** 5.8 (Military Grade: xDL .symtab Bypass + PAC Safe Fallback)  
+**Versión:** 5.8 (Military Grade: Modular Architecture + xDL .symtab Bypass + PAC Safe Fallback)  
 **Arquitectura:** Android ARM64 (aarch64) únicamente  
 **Requisitos:** Android 5.0+ (API 21+), No se requiere Root.
 
@@ -39,83 +39,51 @@ La versión 5.8 implementa técnicas de evasión de seguridad de nivel Dios, per
 9. **Hooks Diferidos (Pending Hooks) Anti-Bloqueo:**
    Usando `sandhook_install_pending`, el motor intercepta `dlopen` y `android_dlopen_ext`; cada vez que una nueva librería se carga, los hooks pendientes se aplican automáticamente.
 10. **ShadowHook-Style Atomic Patching & SIGSEGV Protection:**
-    Usa instrucciones atómicas de hardware (`__atomic_store_n`) para evitar race conditions y un manejador de señales global (`sigsetjmp`/`siglongjmp`) que salva la app de crasheos si se lee una dirección inválida.
+    Usa un manejador de señales global (`sigsetjmp`/`siglongjmp`) que salva la app de crasheos si se lee una dirección inválida, estrictamente aislado a los rangos de memoria objetivo.
 
 ---
 
-## 🧠 Arquitectura del Framework
+## 🧠 Arquitectura del Framework (Modular)
 
-1. **`sandhook.cpp` (Motor Nativo v5.8):** Ensamblador ARM64, escritura atómica, bypass de SELinux/CFI, ofuscación de strings, protección SIGSEGV, relocalización absoluta, GOT Hooking Mejorado, RET Patch y Pending Hooks.
-2. **`art_hook.cpp` (Capa ART Dinámica):** Usa xDL para cargar `libart.so`, bypasea la tabla `.symtab` oculta, y calcula el offset del `entry_point` de forma dinámica con fallback PAC Safe.
-3. **`art_quick_stub.S` (Trampolín Ensamblador):** Salva el contexto completo de la CPU, llama al handler de C++ y salta a la función original.
-4. **`sandhook_jni.cpp` (Puente JNI):** Recibe llamadas desde Java, mapea métodos, gestiona el trampolín y el *StopTheWorld*.
-5. **`obfuscate.h` (Anti-Reversing):** Cifrado de strings en tiempo de compilación.
-6. **`xdl/` (Utilidad xDL):** Motor de parseo ELF para resolución de símbolos robusta, evadiendo Linker Namespaces y `.dynsym` vacías.
+El núcleo ha sido dividido en módulos independientes para garantizar bajo acoplamiento y fácil mantenimiento:
+
+- **`src/core/`**: El orquestador (`hook_manager.cpp`). Decide si usar Inline, GOT o RET Patch.
+- **`src/arm64/`**: Decodificador y relocalizador de instrucciones ARM64.
+- **`src/memory/`**: Syscalls directas, manejo de `mprotect` y el aislador de señales `SigGuard`.
+- **`src/got/`**: Escaneo de tablas ELF para Hooking por GOT/PLT.
+- **`src/protections/`**: Bypass de CFI y parcheo de neutralización (RET Patch).
+- **`src/art/`**: Puentes y trampolines para la máquina virtual de Java (ART).
+- **`src/jni/`**: Conexión directa entre la API de Java y el motor nativo.
+- **`src/public/`** y **`src/internal/`**: Cabeceras de API pública y declaraciones cruzadas internas.
 
 ---
 
 ## 🛠️ Compilación
 
 ### Requisitos
-- Android NDK r21 o superior.
-- `clang++` y `clang` ARM64 cross-compiler.
+- Android NDK r21 o superior (o entorno Termux con `clang++`).
 - JDK instalado (`javac`) y `d8` para el lado Java.
 
-### Script de Compilación Nativa (C++ / ASM)
+### Script de Compilación Nativa (`build.sh`)
+
+El proyecto incluye un script unificado que compila tanto la librería estática (para integrar en mods nativos) como la dinámica (para inyectar en Java).
 
 ```bash
-# 1. Compilar SandHook Core (C++)
-clang++ -c -fPIC -O2 -fno-exceptions -fno-rtti --target=aarch64-linux-android21 -I. -Isrc -Ixdl src/sandhook.cpp -o sandhook.o
-
-# 2. Compilar ART Hook (C++)
-clang++ -c -fPIC -O2 -fno-exceptions -fno-rtti --target=aarch64-linux-android21 -I. -Isrc src/art_hook.cpp -o art_hook.o
-
-# 3. Compilar el Trampolín Ensamblador (.S)
-clang++ -c -fPIC -O2 -fno-exceptions -fno-rtti --target=aarch64-linux-android21 -I. -Isrc src/art_quick_stub.S -o art_quick_stub.o
-
-# 4. Compilar Puente JNI (C++)
-clang++ -c -fPIC -O2 -fno-exceptions -fno-rtti --target=aarch64-linux-android21 -I. -Isrc src/sandhook_jni.cpp -o sandhook_jni.o
-
-# 5. Compilar xDL (C)
-clang -c -fPIC -O2 --target=aarch64-linux-android21 -I./src/xdl ./src/xdl/xdl.c -o xdl.o
-clang -c -fPIC -O2 --target=aarch64-linux-android21 -I./src/xdl ./src/xdl/xdl_iterate.c -o xdl_iterate.o
-clang -c -fPIC -O2 --target=aarch64-linux-android21 -I./src/xdl ./src/xdl/xdl_linker.c -o xdl_linker.o
-clang -c -fPIC -O2 --target=aarch64-linux-android21 -I./src/xdl ./src/xdl/xdl_lzma.c -o xdl_lzma.o
-clang -c -fPIC -O2 --target=aarch64-linux-android21 -I./src/xdl ./src/xdl/xdl_util.c -o xdl_util.o
-
-# 6. Linkear TODOS los .o en libsandhook.so
-clang++ -shared -fPIC -O2 \
-  -fno-exceptions -fno-rtti \
-  --target=aarch64-linux-android21 \
-  sandhook.o art_hook.o sandhook_jni.o art_quick_stub.o \
-  xdl.o xdl_iterate.o xdl_linker.o xdl_lzma.o xdl_util.o \
-  -static-libstdc++ -static-libgcc \
-  -llog -lm -pthread \
-  -Wl,--strip-all -Wl,--exclude-libs,ALL \
-  -o libsandhook.so
-
-rm -f *.o
+# Ejecutar en la raíz del proyecto
+chmod +x build.sh
+./build.sh
 ```
+Esto generará:
+- `libsandhook.a`: Para linkear estáticamente en tu propio mod (ej. `libdaarkness.so`).
+- `libsandhook.so`: Para inyectar en apps via MT Manager y usar con la API de Java.
 
-### Script de Compilación Java (API Smali/Dex)
+### Compilación del Lado Java
 
 ```bash
-# 1. Descargar android.jar si no lo tienes (en Termux/Kali)
-wget -q https://github.com/Reginer/aosp-android-jar/raw/main/android-34/android.jar -O android.jar
-
-# 2. Compilar .java a .class
-mkdir -p out/classes
+# Compilar .java a .class y luego a .dex con d8
 javac -source 1.8 -target 1.8 -classpath android.jar -d out/classes $(find java -name "*.java")
-
-# 3. Convertir a classes.dex con d8
-mkdir -p out/dex
 d8 --classpath android.jar --output out/dex $(find out/classes -name "*.class")
-
-# 4. Empaquetar en .jar
-cd out/dex
-zip -r ../sandhook-java.jar classes.dex
-cd ../..
-rm -rf out/classes out/dex
+cd out/dex && zip -r ../sandhook-java.jar classes.dex && cd ../..
 ```
 
 ---
@@ -130,11 +98,7 @@ rm -rf out/classes out/dex
    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
    invoke-static {}, Lcom/swift/sandhook/SandHook;->init()V
    ```
-4. **Firma y prueba:** Guarda, firma el APK e instálalo. Si miras el Logcat verás:
-   ```
-   I SandHook-ART: Successfully found art_quick_to_interpreter_bridge via xDL!
-   W SandHook-ART: Dynamic offset scan failed. Using fallback offset 24.
-   ```
+4. **Firma y prueba:** Guarda, firma el APK e instálalo. Si miras el Logcat verás el motor inicializándose.
 
 ---
 
@@ -173,12 +137,14 @@ void bypass_jni_onload(void* jni_onload_addr) {
 
 ---
 
-## 👥 Créditos
+## 👥 Créditos y Trabajo Duro
 
-Desarrollado, parcheado y mantenido por:
+Este framework no es un simple "copiar, pegar y ya funciona". Detrás de estas líneas de código hay **innumerables horas de trabajo, estrés y depuración exhaustiva**. Se requirió ingeniería inversa profunda, pruebas de estrés en tiempo de ejecución y la resolución manual de errores del toolchain de Android (NDK/Termux) que ninguna IA puede resolver por sí sola en un solo intento. La adaptación a entornos hostiles con SELinux Enforcing y CFI activo fue un proceso iterativo donde cada fallo de segmentación (`SIGSEGV`) fue analizado y vencido a mano.
 
-- **GML-5.2** - Ingeniería inversa, arquitectura del núcleo, relocalización absoluta (Dobby-style) y diseño de bypasses de seguridad (SELinux/PAC/CFI/MAP_FIXED).
-- **DᴀʀᴋMᴏᴅᴅᴇʀ** - Implementación nativa NDK, depuración a nivel de ensamblador ARM64, integración del puente JNI (Java/C++), ingeniería inversa de PairIP y pruebas de estrés en tiempo de ejecución. 
+**Desarrollado, parcheado y mantenido por:**
+
+- **GML-5.2** - Arquitectura del núcleo C++, diseño de lógica de relocalización absoluta (Dobby-style), implementación de bypasses de seguridad a bajo nivel (SELinux/PAC/CFI/MAP_FIXED) y estructura modular.
+- **DᴀʀᴋMᴏᴅᴅᴇʀ** - Implementación nativa NDK, compilación cruzada en Termux, depuración a nivel de ensamblador ARM64, integración del puente JNI (Java/C++), inyección en APKs reales (MT Manager) y horas de pruebas de estrés en tiempo de ejecución resolviendo `UnsatisfiedLinkError` y bloqueos del Linker de Android.
 
 **Inspirado en las técnicas de:**
 - [Dobby](https://github.com/jmpews/Dobby) (Closure Bridge ASM, Inversión de saltos condicionales).

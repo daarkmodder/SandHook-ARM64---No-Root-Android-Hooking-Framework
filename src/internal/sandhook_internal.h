@@ -1,0 +1,88 @@
+#pragma once
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
+#include <sys/mman.h>
+#include <android/log.h>
+#include <signal.h>
+#include <setjmp.h>
+#include <link.h>
+#include <elf.h>
+#include "../obfuscate.h"
+#include "../public/sandhook.h"
+#include "../xdl/xdl.h"
+
+#define LOG_TAG "SandHook-Prod"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+
+#ifndef PROT_BTI
+#define PROT_BTI 0x10
+#endif
+
+namespace sandhook {
+
+constexpr std::size_t kPageSize = 4096;
+constexpr std::size_t kMinPatchSize = 20;
+constexpr std::size_t kTrampolineSize = 512;
+constexpr std::size_t kMaxPrologueSize = 200;
+
+typedef std::uintptr_t Address;
+
+struct GOTHookEntry {
+    void** slot;
+    void* original;
+};
+
+// --- MEMORY MODULE ---
+namespace Mem {
+    bool page_protect(void* addr, std::size_t len, int prot);
+    bool make_rw(void* addr, std::size_t len);
+    bool make_rx(void* addr, std::size_t len);
+    void flush_caches(void* addr, std::size_t len);
+}
+bool write_mem_proc(void* addr, const void* data, size_t len);
+bool is_system_critical_lib(void* target);
+bool is_executable_region(void* target);
+void atomic_write_inst(void* target, const void* inst, size_t len);
+
+// --- SIG GUARD MODULE ---
+class SigGuard {
+    sigjmp_buf jmpbuf_;
+    bool jumped_ = false;
+public:
+    SigGuard(uintptr_t range_start, uintptr_t range_end);
+    ~SigGuard();
+    bool jumped() const { return jumped_; }
+};
+
+// --- ARM64 MODULE ---
+namespace arm64 {
+    namespace Asm {
+        void emit_movz_movk_br(std::uint8_t* out, Address target);
+        void fill_nops(std::uint8_t* out, std::size_t start, std::size_t end);
+    }
+}
+struct Relocator {
+    struct Result { std::size_t copied = 0; std::size_t tramp_size = 0; int error = HOOK_OK; };
+    static Result relocate(void* src, void* tramp, std::size_t min_patch = kMinPatchSize);
+};
+
+// --- GOT MODULE ---
+bool got_hook_all_modules(void* target, void* replacement, std::vector<GOTHookEntry>& entries);
+
+// --- PROTECTIONS MODULE ---
+void maybe_disable_cfi();
+void maybe_restore_cfi();
+bool has_cfi_bypass_failed();
+bool install_ret_patch(void* target, int64_t return_value_x0 = 0, bool set_x0 = false);
+bool remove_ret_patch(void* target);
+
+} // namespace sandhook
