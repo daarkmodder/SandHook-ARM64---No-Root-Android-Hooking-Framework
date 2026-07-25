@@ -38,7 +38,6 @@ namespace sandhook {
                 return;
             }
 
-            // Intentar buscar el símbolo en la tabla dinámica y estática
             void* interpreter_bridge = xdl_sym(libart, "art_quick_to_interpreter_bridge", nullptr);
             if (!interpreter_bridge) {
                 LOGW("Symbol not in .dynsym. Trying hidden .symtab via xdl_dsym...");
@@ -48,7 +47,7 @@ namespace sandhook {
             if (!interpreter_bridge) {
                 LOGW("Could not find art_quick_to_interpreter_bridge. Using fallback offset 24.");
                 entry_point_offset = 24; 
-                xdl_close(libart);
+                xdl_close(libart); // FIX DE FUGA
                 return;
             }
 
@@ -62,7 +61,7 @@ namespace sandhook {
             if (!dummy_method) {
                 LOGE("Failed to get dummy method for offset calculation.");
                 entry_point_offset = 24;
-                xdl_close(libart);
+                xdl_close(libart); // FIX DE FUGA
                 return;
             }
 
@@ -85,7 +84,7 @@ namespace sandhook {
                 LOGI("Dynamic ArtMethod offset found successfully: %zu", entry_point_offset);
             }
             
-            xdl_close(libart);
+            xdl_close(libart); // FIX DE FUGA AL FINAL
         }
 
         void* pac_strip(void* addr) {

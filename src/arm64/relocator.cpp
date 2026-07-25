@@ -22,7 +22,9 @@ static inline Kind decode_kind(std::uint32_t insn) {
     if ((insn & 0xFF000000) == 0x58000000) return Kind::LDR_LIT;
     if ((insn & 0xFF800000) == 0xD2800000) return Kind::MOVZ;
     if ((insn & 0xFF800000) == 0xF2800000) return Kind::MOVK;
-    return Kind::Other;
+    
+    // FIX: Devolver Unknown para que el check posterior funcione correctamente
+    return Kind::Unknown;
 }
 
 void Asm::emit_movz_movk_br(std::uint8_t* out, Address target) {
@@ -51,15 +53,20 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
         std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4; std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
         std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
     };
+    
+    // FIX: Lógica de alineación corregida y new_imm = 5 (20 bytes de skip)
     auto emit_cond_abs_jump = [&](std::uint32_t insn, int imm_shift, int imm_mask, Address target) {
-        if ((tramp_offset % 8) == 0) { std::uint32_t nop = 0xD503201F; std::memcpy(t + tramp_offset, &nop, 4); tramp_offset += 4; }
-        std::uint32_t inv_insn = insn ^ (1 << 24); std::uint32_t new_imm = 3; 
+        if ((tramp_offset % 8) != 0) { std::uint32_t nop = 0xD503201F; std::memcpy(t + tramp_offset, &nop, 4); tramp_offset += 4; }
+        std::uint32_t inv_insn = insn ^ (1 << 24); 
+        // Saltar 20 bytes: inv_insn(4) + LDR(4) + BR(4) + Addr(8) = 20. 20/4 = 5.
+        std::uint32_t new_imm = 5; 
         inv_insn = (inv_insn & ~(imm_mask << imm_shift)) | ((new_imm & imm_mask) << imm_shift);
         std::memcpy(t + tramp_offset, &inv_insn, 4); tramp_offset += 4;
         std::uint32_t ldr_x16 = 0x58000050; std::uint32_t br_x16 = 0xD61F0200;
         std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4; std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
         std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
     };
+    
     auto emit_ldr_lit_abs = [&](std::uint32_t insn, Address target) {
         int rt = insn & 0x1F; if ((tramp_offset % 8) != 0) { std::uint32_t nop = 0xD503201F; std::memcpy(t + tramp_offset, &nop, 4); tramp_offset += 4; }
         std::uint32_t ldr_x16 = 0x58000050; std::uint32_t ldr_rt = 0xF9400200 | rt;
@@ -74,8 +81,15 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
             if (copied + 4 > kMaxPrologueSize) { r.error = HOOK_BOUNDS_EXCEEDED; return r; }
             std::uint32_t insn; std::memcpy(&insn, s + copied, 4);
             auto kind = arm64::decode_kind(insn);
-            if (kind == arm64::Kind::Unknown) { r.error = HOOK_RELOCATION_FAILED; return r; }
-            std::uint32_t reloced = insn; Address insn_addr = src_addr + copied;
+            
+            if (kind == arm64::Kind::Unknown) {
+                LOGE("[Relocator] Instrucción no soportada (0x%08x) en offset %zu. Falló el hook.", insn, copied);
+                r.error = HOOK_RELOCATION_FAILED; 
+                return r; 
+            }
+
+            std::uint32_t reloced = insn; 
+            Address insn_addr = src_addr + copied;
 
             if (kind == arm64::Kind::ADRP) {
                 std::int64_t immlo = (insn >> 29) & 0x3; std::int64_t immhi = (insn >> 5) & 0x7FFFF; std::int64_t imm21 = (immhi << 2) | immlo;

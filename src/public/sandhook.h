@@ -20,7 +20,6 @@ extern "C" {
 #define HOOK_PROTECTED              12
 
 int sandhook_install_ex(void* target, void* replacement, void** original_out);
-int sandhook_install_single_insn(void* target, void* replacement, void** original_out);
 int sandhook_remove(void* target);
 int sandhook_ret_patch(void* target, int64_t return_value, int use_return_value);
 int sandhook_install_pending(const char* lib_name, const char* sym_name, void* replacement, void** original_out);
