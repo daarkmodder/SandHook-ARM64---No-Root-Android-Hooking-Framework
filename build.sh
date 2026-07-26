@@ -48,17 +48,17 @@ if [ "$option" == "1" ]; then
 
     echo "Linkeando libsandhook.so..."
     clang++ -shared -fPIC -O2 \
-      -fno-exceptions -fno-rtti \
-      --target=$TARGET \
-      mem.o sig_guard.o relocator.o got_hook.o cfi_bypass.o ret_patch.o hook_manager.o \
-      art_hook.o sandhook_jni.o art_quick_stub.o \
-      xdl.o xdl_iterate.o xdl_linker.o xdl_lzma.o xdl_util.o \
-      -static-libstdc++ \
-      -static-libgcc \
-      -llog -lm -pthread \
-      -Wl,--strip-all \
-      -Wl,--exclude-libs,ALL \
-      -o libsandhook.so
+    -fno-exceptions -fno-rtti \
+    --target=$TARGET \
+    mem.o sig_guard.o relocator.o got_hook.o cfi_bypass.o ret_patch.o hook_manager.o utils.o \
+    art_hook.o sandhook_jni.o art_quick_stub.o \
+    xdl.o xdl_iterate.o xdl_linker.o xdl_lzma.o xdl_util.o \
+    -static-libstdc++ \
+    -static-libgcc \
+    -llog -lm -pthread \
+    -Wl,--strip-all \
+    -Wl,--exclude-libs,ALL \
+    -o libsandhook.so
 
     rm -f *.o
     echo -e "${GREEN}✅ ¡Compilación exitosa!${NC}"
