@@ -22,12 +22,11 @@ static inline Kind decode_kind(std::uint32_t insn) {
     if ((insn & 0xFF000000) == 0x58000000) return Kind::LDR_LIT;
     if ((insn & 0xFF800000) == 0xD2800000) return Kind::MOVZ;
     if ((insn & 0xFF800000) == 0xF2800000) return Kind::MOVK;
-    
-    // FIX: Devolver Unknown para que el check posterior funcione correctamente
     return Kind::Unknown;
 }
 
-void Asm::emit_movz_movk_br(std::uint8_t* out, Address target) {
+// Renombrado Asm -> Inst
+void Inst::emit_movz_movk_br(std::uint8_t* out, Address target) {
     auto emit32 = [&](std::uint32_t w) { std::memcpy(out, &w, 4); out += 4; };
     emit32(0xD2800000 | (16 & 31) | ((target & 0xFFFFULL) << 5));
     emit32(0xF2800000 | (16 & 31) | (((target >> 16) & 0xFFFFULL) << 5) | (1u << 21));
@@ -36,13 +35,14 @@ void Asm::emit_movz_movk_br(std::uint8_t* out, Address target) {
     emit32(0xD61F0000 | ((16 & 31) << 5));
 }
 
-void Asm::fill_nops(std::uint8_t* out, std::size_t start, std::size_t end) {
+void Inst::fill_nops(std::uint8_t* out, std::size_t start, std::size_t end) {
     for (std::size_t off = start; off < end; off += 4) { std::uint32_t nop = 0xD503201F; std::memcpy(out + off, &nop, 4); }
 }
 
 } // namespace arm64
 
-Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_patch) {
+// FIX: Acepta max_size para no sobrepasar el tamaño del símbolo
+Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_patch, std::size_t max_size) {
     Result r{}; auto* s = reinterpret_cast<std::uint8_t*>(src); auto* t = reinterpret_cast<std::uint8_t*>(tramp);
     Address src_addr = reinterpret_cast<Address>(src); Address tramp_addr = reinterpret_cast<Address>(tramp);
     std::size_t copied = 0, tramp_offset = 0;
@@ -53,20 +53,15 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
         std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4; std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
         std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
     };
-    
-    // FIX: Lógica de alineación corregida y new_imm = 5 (20 bytes de skip)
     auto emit_cond_abs_jump = [&](std::uint32_t insn, int imm_shift, int imm_mask, Address target) {
         if ((tramp_offset % 8) != 0) { std::uint32_t nop = 0xD503201F; std::memcpy(t + tramp_offset, &nop, 4); tramp_offset += 4; }
-        std::uint32_t inv_insn = insn ^ (1 << 24); 
-        // Saltar 20 bytes: inv_insn(4) + LDR(4) + BR(4) + Addr(8) = 20. 20/4 = 5.
-        std::uint32_t new_imm = 5; 
+        std::uint32_t inv_insn = insn ^ (1 << 24); std::uint32_t new_imm = 5; 
         inv_insn = (inv_insn & ~(imm_mask << imm_shift)) | ((new_imm & imm_mask) << imm_shift);
         std::memcpy(t + tramp_offset, &inv_insn, 4); tramp_offset += 4;
         std::uint32_t ldr_x16 = 0x58000050; std::uint32_t br_x16 = 0xD61F0200;
         std::memcpy(t + tramp_offset, &ldr_x16, 4); tramp_offset += 4; std::memcpy(t + tramp_offset, &br_x16, 4); tramp_offset += 4;
         std::memcpy(t + tramp_offset, &target, 8); tramp_offset += 8;
     };
-    
     auto emit_ldr_lit_abs = [&](std::uint32_t insn, Address target) {
         int rt = insn & 0x1F; if ((tramp_offset % 8) != 0) { std::uint32_t nop = 0xD503201F; std::memcpy(t + tramp_offset, &nop, 4); tramp_offset += 4; }
         std::uint32_t ldr_x16 = 0x58000050; std::uint32_t ldr_rt = 0xF9400200 | rt;
@@ -75,10 +70,11 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
     };
 
     {
-        SigGuard guard(src_addr, src_addr + kMaxPrologueSize);
+        SigGuard guard(src_addr, src_addr + max_size);
         if (guard.jumped()) { r.error = HOOK_INVALID_TARGET; return r; }
         while (copied < min_patch) {
-            if (copied + 4 > kMaxPrologueSize) { r.error = HOOK_BOUNDS_EXCEEDED; return r; }
+            // FIX: Usar max_size en lugar de kMaxPrologueSize
+            if (copied + 4 > max_size) { r.error = HOOK_BOUNDS_EXCEEDED; return r; }
             std::uint32_t insn; std::memcpy(&insn, s + copied, 4);
             auto kind = arm64::decode_kind(insn);
             
@@ -125,7 +121,7 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
             copied += 4;
         }
     }
-    arm64::Asm::emit_movz_movk_br(t + tramp_offset, src_addr + copied);
+    arm64::Inst::emit_movz_movk_br(t + tramp_offset, src_addr + copied);
     r.copied = copied; r.tramp_size = tramp_offset + 20; r.error = HOOK_OK; return r;
 }
 

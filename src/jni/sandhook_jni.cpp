@@ -72,39 +72,35 @@ Java_com_swift_sandhook_SandHook_nativeHookMethod(JNIEnv* env, jclass clazz,
     ensure_art_initialized(env);
 
     jmethodID origin_meth = env->FromReflectedMethod(originMethod);
-    if (!origin_meth) return JNI_FALSE;
+    jmethodID hook_meth = env->FromReflectedMethod(hookMethod);
+    if (!origin_meth || !hook_meth) return JNI_FALSE;
 
-    // Obtenemos la dirección original del método de Java
+    // 1. Obtener las direcciones de ejecución nativa (Quick Code)
     void* origin_addr = sandhook::art::getQuickEntryPoint(origin_meth);
-    if (!origin_addr) {
-        LOGE("Failed to get ART entry point for origin method.");
+    void* hook_addr = sandhook::art::getQuickEntryPoint(hook_meth);
+
+    if (!origin_addr || !hook_addr) {
+        LOGE("Failed to get ART entry points.");
         return JNI_FALSE;
     }
 
-    // Obtenemos la dirección del trampolín en ensamblador
-    void* stub_addr = sandhook::art::get_quick_stub();
+    LOGI("ART Hook: Origin %p -> Hook %p", origin_addr, hook_addr);
 
-    LOGI("ART Hook: Redirigiendo método original %p hacia el stub %p", origin_addr, stub_addr);
-
-    // Guardamos la dirección original en nuestro mapa
-    {
-        std::lock_guard<std::mutex> lk(g_hook_mu);
-        g_hooked_methods[origin_meth] = origin_addr;
-    }
-
-    // Cambiamos el entry point del método Java para que apunte a nuestro ensamblador.
-    sandhook::art::setQuickEntryPoint(origin_meth, stub_addr);
-
+    // 2. Si hay un método backup, le ponemos la dirección original
+    // Esto permite que llames a backup() desde tu hook y se ejecute el código real.
     if (backupMethod != nullptr) {
         jmethodID backup_meth = env->FromReflectedMethod(backupMethod);
         if (backup_meth) {
-            // El método backup apunta a la dirección original para poder llamarla
             sandhook::art::setQuickEntryPoint(backup_meth, origin_addr);
-            LOGI("Método backup configurado correctamente.");
+            LOGI("Método backup configurado con la dirección original.");
         }
     }
 
-    LOGI("ART Hook instalado correctamente vía Trampolín Ensamblador.");
+    // 3. LA MAGIA: Sobrescribir el método original con la dirección del método hook
+    // Cuando ART llame a originMethod, saltará directamente a hookMethod.
+    sandhook::art::setQuickEntryPoint(origin_meth, hook_addr);
+
+    LOGI("ART Hook instalado correctamente (Direct Swap).");
     return JNI_TRUE;
 }
 

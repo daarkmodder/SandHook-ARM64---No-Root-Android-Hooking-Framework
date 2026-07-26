@@ -8,11 +8,13 @@
 #include <mutex>
 #include <atomic>
 #include <sys/mman.h>
-#include <android/log.h>
 #include <signal.h>
 #include <setjmp.h>
 #include <link.h>
 #include <elf.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <android/log.h>
 #include "../obfuscate.h"
 #include "../public/sandhook.h"
 #include "../xdl/xdl.h"
@@ -36,10 +38,7 @@ constexpr std::size_t kMaxPrologueSize = 200;
 
 typedef std::uintptr_t Address;
 
-struct GOTHookEntry {
-    void** slot;
-    void* original;
-};
+struct GOTHookEntry { void** slot; void* original; };
 
 // --- MEMORY MODULE ---
 namespace Mem {
@@ -52,6 +51,7 @@ bool write_mem_proc(void* addr, const void* data, size_t len);
 bool is_system_critical_lib(void* target);
 bool is_executable_region(void* target);
 void atomic_write_inst(void* target, const void* inst, size_t len);
+bool read_proc_maps_syscall(std::string& out);
 
 // --- SIG GUARD MODULE ---
 class SigGuard {
@@ -63,16 +63,17 @@ public:
     bool jumped() const { return jumped_; }
 };
 
-// --- ARM64 MODULE ---
+// --- ARM64 MODULE (Renombrado a Inst) ---
 namespace arm64 {
-    namespace Asm {
+    namespace Inst {
         void emit_movz_movk_br(std::uint8_t* out, Address target);
         void fill_nops(std::uint8_t* out, std::size_t start, std::size_t end);
     }
 }
 struct Relocator {
     struct Result { std::size_t copied = 0; std::size_t tramp_size = 0; int error = HOOK_OK; };
-    static Result relocate(void* src, void* tramp, std::size_t min_patch = kMinPatchSize);
+    // FIX: Añadido max_size para limitar el escaneo según el tamaño real del símbolo
+    static Result relocate(void* src, void* tramp, std::size_t min_patch = kMinPatchSize, std::size_t max_size = kMaxPrologueSize);
 };
 
 // --- GOT MODULE ---
@@ -84,5 +85,11 @@ void maybe_restore_cfi();
 bool has_cfi_bypass_failed();
 bool install_ret_patch(void* target, int64_t return_value_x0 = 0, bool set_x0 = false);
 bool remove_ret_patch(void* target);
+
+// --- UTILS MODULE ---
+uintptr_t find_pattern_in_lib(const char* lib_name, const char* pattern);
+void* get_cached_xdl_handle(const char* lib_name);
+bool write_nop_internal(void* addr, int count);
+bool write_ret_internal(void* addr);
 
 } // namespace sandhook

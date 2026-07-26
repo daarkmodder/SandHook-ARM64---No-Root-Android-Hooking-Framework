@@ -30,7 +30,7 @@ bool write_mem_proc(void* addr, const void* data, size_t len) {
     return false;
 }
 
-static bool read_proc_maps_syscall(std::string& out) {
+bool read_proc_maps_syscall(std::string& out) {
     const char* maps_path = AY_OBFUSCATE("/proc/self/maps");
     int fd = syscall(SYS_openat, AT_FDCWD, maps_path, O_RDONLY | O_CLOEXEC, 0);
     if (fd < 0) return false;

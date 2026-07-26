@@ -1,5 +1,7 @@
 #!/bin/bash
 
+clear
+
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 CYAN='\033[0;36m'
@@ -32,16 +34,17 @@ if [ "$option" == "1" ]; then
     clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/protections/cfi_bypass.cpp -o cfi_bypass.o
     clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/protections/ret_patch.cpp -o ret_patch.o
     clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/core/hook_manager.cpp -o hook_manager.o
+    clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/core/utils.cpp -o utils.o
 
     echo "Empaquetando libsandhook.a..."
     ar rcs libsandhook.a \
-      mem.o sig_guard.o relocator.o got_hook.o cfi_bypass.o ret_patch.o hook_manager.o \
-      xdl.o xdl_iterate.o xdl_linker.o xdl_lzma.o xdl_util.o
+  mem.o sig_guard.o relocator.o got_hook.o cfi_bypass.o ret_patch.o hook_manager.o utils.o \
+  xdl.o xdl_iterate.o xdl_linker.o xdl_lzma.o xdl_util.o
 
     echo "Compilando Módulos ART y JNI..."
     clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/art/art_hook.cpp -o art_hook.o
     clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/art/art_quick_stub.S -o art_quick_stub.o
-    clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/jni/sandhook_jni.cpp -o sandhook_jni.o
+    clang++ -c $COMMON_FLAGS --target=$TARGET $INCLUDES src/jni/sandhook_jni.cpp -o sandhook_jni.o  
 
     echo "Linkeando libsandhook.so..."
     clang++ -shared -fPIC -O2 \
