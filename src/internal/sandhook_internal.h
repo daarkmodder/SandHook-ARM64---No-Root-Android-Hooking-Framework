@@ -32,7 +32,7 @@
 namespace sandhook {
 
 constexpr std::size_t kPageSize = 4096;
-constexpr std::size_t kMinPatchSize = 20;
+constexpr std::size_t kMinPatchSize = 16; // FIX Dobby: Reducido de 20 a 16 (LDR + BR + Addr)
 constexpr std::size_t kTrampolineSize = 512;
 constexpr std::size_t kMaxPrologueSize = 200;
 
@@ -63,16 +63,16 @@ public:
     bool jumped() const { return jumped_; }
 };
 
-// --- ARM64 MODULE (Renombrado a Inst) ---
+// --- ARM64 MODULE (Estilo Dobby) ---
 namespace arm64 {
     namespace Inst {
-        void emit_movz_movk_br(std::uint8_t* out, Address target);
+        // Cambiado a LDR + BR (16 bytes)
+        void emit_ldr_br(std::uint8_t* out, Address target);
         void fill_nops(std::uint8_t* out, std::size_t start, std::size_t end);
     }
 }
 struct Relocator {
     struct Result { std::size_t copied = 0; std::size_t tramp_size = 0; int error = HOOK_OK; };
-    // FIX: Añadido max_size para limitar el escaneo según el tamaño real del símbolo
     static Result relocate(void* src, void* tramp, std::size_t min_patch = kMinPatchSize, std::size_t max_size = kMaxPrologueSize);
 };
 

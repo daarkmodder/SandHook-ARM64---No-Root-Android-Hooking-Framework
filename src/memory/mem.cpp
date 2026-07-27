@@ -82,18 +82,78 @@ bool Mem::page_protect(void* addr, std::size_t len, int prot) {
     Address end = align_up(reinterpret_cast<Address>(addr) + len);
     return syscall(SYS_mprotect, reinterpret_cast<void*>(start), end - start, prot) == 0;
 }
+
 bool Mem::make_rw(void* addr, std::size_t len) { return page_protect(addr, len, PROT_READ | PROT_WRITE); }
+
 bool Mem::make_rx(void* addr, std::size_t len) {
+    // Intento 1: mprotect normal
     if (page_protect(addr, len, PROT_READ | PROT_EXEC)) return true;
-    return page_protect(addr, len, PROT_READ | PROT_EXEC | PROT_BTI);
+    if (page_protect(addr, len, PROT_READ | PROT_EXEC | PROT_BTI)) return true;
+
+    // Intento 2: Dobby Page Shadowing (Bypass de SELinux execmod)
+    Address start = align_down(reinterpret_cast<Address>(addr));
+    Address end = align_up(reinterpret_cast<Address>(addr) + len);
+    std::size_t page_len = end - start;
+    
+    // 1. Hacemos una copia de los bytes actuales (que ya tienen nuestro parche/RET)
+    std::vector<std::uint8_t> backup(page_len);
+    std::memcpy(backup.data(), reinterpret_cast<void*>(start), page_len);
+    
+    // 2. Mapeamos una nueva página anónima EXACTAMENTE en la misma dirección física
+    void* new_mem = (void*)syscall(SYS_mmap, reinterpret_cast<void*>(start), page_len, 
+                                   PROT_READ | PROT_WRITE, 
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (new_mem == MAP_FAILED) return false;
+    
+    // 3. Pegamos los bytes originales (con nuestro hook incluido) en la nueva página
+    std::memcpy(new_mem, backup.data(), page_len);
+    
+    // 4. Ahora sí, le damos permisos de ejecución. Como es anónima, SELinux lo permite.
+    if (page_protect(new_mem, page_len, PROT_READ | PROT_EXEC)) return true;
+    return page_protect(new_mem, page_len, PROT_READ | PROT_EXEC | PROT_BTI);
 }
+
 void Mem::flush_caches(void* addr, std::size_t len) {
     __builtin___clear_cache(reinterpret_cast<char*>(addr), reinterpret_cast<char*>(addr) + len);
     asm volatile("isb" ::: "memory"); asm volatile("dsb sy" ::: "memory");
 }
 
+// ============================================================================
+// FIX ShadowHook: Escritura atómica segura para evitar race conditions.
+// ============================================================================
 void atomic_write_inst(void* target, const void* inst, size_t len) {
-    std::memcpy(target, inst, len); // Safe with StopTheWorld
+    uintptr_t addr = reinterpret_cast<uintptr_t>(target);
+    
+    if (len == 4 && (addr % 4) == 0) {
+        uint32_t val;
+        std::memcpy(&val, inst, sizeof(val));
+        __atomic_store_n(reinterpret_cast<uint32_t*>(addr), val, __ATOMIC_SEQ_CST);
+    } 
+    else if (len == 4 && (addr % 2) == 0) {
+        // Escritura atómica en dos pasos de 2 bytes (para Thumb o desalineado)
+        uint16_t* dst = reinterpret_cast<uint16_t*>(target);
+        const uint16_t* src = reinterpret_cast<const uint16_t*>(inst);
+        __atomic_store_n(&dst[0], src[0], __ATOMIC_RELAXED);
+        __atomic_store_n(&dst[1], src[1], __ATOMIC_SEQ_CST);
+    } 
+    else if (len == 8 && (addr % 8) == 0) {
+        uint64_t val;
+        std::memcpy(&val, inst, sizeof(val));
+        __atomic_store_n(reinterpret_cast<uint64_t*>(addr), val, __ATOMIC_SEQ_CST);
+    } 
+    else if (len == 8 && (addr % 4) == 0) {
+        // Escritura atómica en dos pasos de 4 bytes
+        uint32_t* dst = reinterpret_cast<uint32_t*>(target);
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(inst);
+        __atomic_store_n(&dst[0], src[0], __ATOMIC_RELAXED);
+        __atomic_store_n(&dst[1], src[1], __ATOMIC_SEQ_CST);
+    } 
+    else {
+        // Fallback para 16 bytes (LDR + BR) o desalineamientos mayores.
+        // Usamos memcpy porque el trampolín de 16 bytes tiene un NOP al final,
+        // evitando que la CPU lea basura a medias.
+        std::memcpy(target, inst, len);
+    }
 }
 
 } // namespace sandhook

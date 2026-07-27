@@ -2,20 +2,20 @@
 
 Un framework de hooking de **nivel empresarial/militar** para Android ARM64. Funciona sin root y es compatible con Android 5.0 hasta Android 14+. Soporta tanto **Hooking Nativo (C/C++)** como **Hooking de Java (ART/Dalvik)**.
 
-Este proyecto es el resultado de una fusión manual y depuración exhaustiva de las técnicas más avanzadas de los motores de hooking más respetados de la industria (Dobby, ShadowHook, ByteHook, xHook, And64InlineHook, LSPosed, ARMPatch, GlossHook), combinadas en un núcleo C++ puro, limpio y ultrarrápido.
+Este proyecto es el resultado de una fusión manual y depuración exhaustiva de las técnicas más avanzadas de los motores de hooking más respetados de la industria (Dobby, ShadowHook, ByteHook, GlossHook, xHook, And64InlineHook, LSPosed, ARMPatch), combinadas en un núcleo C++ puro, limpio y ultrarrápido.
 
 > ⚠️ **Aviso de Compatibilidad:** 
 > Este framework está escrito y optimizado estrictamente para **C++ y Ensamblador (ARM64)**. Recompilación con `clang++` y la librería estándar de C++.
 
-**Versión:** 5.9 (Military Grade: GlossHook SymSize + Direct ART Swap + Pattern Scanner)  
+**Versión:** 6.0 (Military Grade: Hybrid Engine - Dobby + ShadowHook + GlossHook)  
 **Arquitectura:** Android ARM64 (aarch64) únicamente  
 **Requisitos:** Android 5.0+ (API 21+), No se requiere Root.
 
 ---
 
-## 🔥 Características Principales (v5.9)
+## 🔥 Características Principales (v6.0)
 
-La versión 5.9 implementa técnicas de evasión de seguridad de nivel Dios, permitiendo hookear aplicaciones en Android 13/14 con SELinux Enforcing y CFI activos sin causar crasheos:
+La versión 6.0 implementa técnicas de evasión de seguridad de nivel Dios, permitiendo hookear aplicaciones en Android 13/14 con SELinux Enforcing y CFI activos sin causar crasheos:
 
 1. **Ofuscación de Strings en Tiempo de Compilación:**
    Integración de `obfuscate.h` (AY_OBFUSCATE). Todas las cadenas de texto sensibles (`/proc/self/mem`, `libart.so`, `__cfi_slowpath`) se cifran con XOR en tiempo de compilación. Los decompiladores (Ghidra/IDA Pro) solo verán basura ilegible.
@@ -34,13 +34,17 @@ La versión 5.9 implementa técnicas de evasión de seguridad de nivel Dios, per
    - Nivel 1: Intenta **GOT Hooking Mejorado** (escaneo `.rela.plt` y `.rela.dyn`).
    - Nivel 2: Si GOT falla, aplica **RET Patch (Neutralización)**.
    - Nivel 3: Si nada funciona, falla limpiamente devolviendo `HOOK_PROTECTED`.
-8. **Relocator con Límite de Tamaño de Símbolo (GlossHook Style):**
-   El relocalizador ARM64 ahora obtiene el tamaño real del símbolo (`dli_ssize` vía xDL) antes de copiar el prologue. Esto evita corrupciones de memoria silenciosas al intentar hookear funciones muy cortas.
-9. **Pattern Scanner y Utilidades de Bajo Nivel (ARMPatch Style):**
-   Se ha añadido `sandhook_find_pattern` para escanear patrones de bytes con comodines (`??`), un cache de handles xDL para evitar fugas de memoria, y macros de conveniencia (`DECL_HOOK`, `HOOK_ADDR`, `HOOK_SYM`).
-10. **Hooks Diferidos (Pending Hooks) Anti-Bloqueo:**
+8. **Dobby Page Shadowing (Bypass de SELinux execmod):**
+   Cuando SELinux prohíbe usar `mprotect` para devolverle el permiso de ejecución a una página de memoria, el motor usa la técnica de Dobby: crea una página anónima nueva con `mmap` y `MAP_FIXED` exactamente en la misma dirección física. Como es anónima, SELinux permite darle permisos de ejecución, salvando la app de crashear.
+9. **ShadowHook Atomic Patching:**
+   Para evitar race conditions y crasheos intermitentes en entornos multihilo, la escritura de los parches en memoria se realiza utilizando instrucciones atómicas de hardware (`__atomic_store_n`) inspiradas en ShadowHook, garantizando que ningún hilo lea el código a medias.
+10. **Salto Absoluto Limpio de 16 bytes (LDR + BR):**
+    Inspirado en Dobby, el motor inyecta un salto absoluto de 16 bytes (`LDR X16, #8` + `BR X16` + `Addr`). Esto redujo el tamaño mínimo del parche de 20 a 16 bytes, permitiendo hookear funciones mucho más cortas sin fallar por límites de tamaño.
+11. **Pattern Scanner y Utilidades de Bajo Nivel (ARMPatch Style):**
+    Se ha añadido `sandhook_find_pattern` para escanear patrones de bytes con comodines (`??`), un cache de handles xDL para evitar fugas de memoria, y macros de conveniencia (`DECL_HOOK`, `HOOK_ADDR`, `HOOK_SYM`).
+12. **Hooks Diferidos (Pending Hooks) Anti-Bloqueo:**
     Usando `sandhook_install_pending`, el motor intercepta `dlopen` y `android_dlopen_ext`; cada vez que una nueva librería se carga, los hooks pendientes se aplican automáticamente usando el motor xDL.
-11. **ShadowHook-Style Atomic Patching & SIGSEGV Protection:**
+13. **ShadowHook-Style Atomic Patching & SIGSEGV Protection:**
     Usa un manejador de señales global (`sigsetjmp`/`siglongjmp`) que salva la app de crasheos si se lee una dirección inválida, estrictamente aislado a los rangos de memoria objetivo.
 
 ---
@@ -49,9 +53,9 @@ La versión 5.9 implementa técnicas de evasión de seguridad de nivel Dios, per
 
 El núcleo ha sido dividido en módulos independientes para garantizar bajo acoplamiento y fácil mantenimiento:
 
-- **`src/core/`**: El orquestador (`hook_manager.cpp`). Decide si usar Inline, GOT o RET Patch.
+- **`src/core/`**: El orquestador (`hook_manager.cpp`). Decide si usar Inline, GOT o RET Patch. Incluye utilidades y cache de xDL.
 - **`src/arm64/`**: Decodificador y relocalizador de instrucciones ARM64 (Namespace `Inst`).
-- **`src/memory/`**: Syscalls directas, manejo de `mprotect` y el aislador de señales `SigGuard`.
+- **`src/memory/`**: Syscalls directas, manejo de `mprotect`, bypass `MAP_FIXED` y el aislador de señales `SigGuard`.
 - **`src/got/`**: Escaneo de tablas ELF para Hooking por GOT/PLT.
 - **`src/protections/`**: Bypass de CFI y parcheo de neutralización (RET Patch).
 - **`src/art/`**: Puentes y trampolines para la máquina virtual de Java (ART).
@@ -160,14 +164,14 @@ Sin embargo, la arquitectura central, la depuración de corrupciones de memoria,
 El desarrollo de herramientas de hooking a bajo nivel requiere pruebas exhaustivas y una adaptación constante a las barreras de seguridad de cada versión de Android. Agradecemos profundamente el feedback constructivo y los reportes de errores objetivos y precisos que ayudan a mejorar la estabilidad del motor. Este framework se mantiene enfocado en ofrecer una solución híbrida (Inline -> GOT -> RET) robusta y funcional, priorizando la estabilidad en entornos hostiles por encima de debates estériles sobre el origen del código.
 
 **Inspirado en las técnicas de:**
-- [Dobby](https://github.com/jmpews/Dobby) (Closure Bridge ASM, Inversión de saltos condicionales).
-- [ShadowHook](https://github.com/bytedance/android-inline-hook) (Escritura atómica y PAC Stripping).
+- [Dobby](https://github.com/jmpews/Dobby) (Page Shadowing MAP_FIXED, Absolute Jump LDR+BR).
+- [ShadowHook](https://github.com/bytedance/android-inline-hook) (Escritura atómica multi-hilo).
 - [ByteHook](https://github.com/bytedance/android-inline-hook) (Bypass de CFI Slowpath).
+- [GlossHook](https://github.com/AoThenBiceps/GlossHook) (Límite de tamaño de símbolo en el relocator).
 - [xHook](https://github.com/iqiyi/xHook) (Manejo seguro de señales SIGSEGV).
 - [xDL](https://github.com/hexhacking/xDL) (Resolución de símbolos ELF robusta).
 - [And64InlineHook](https://github.com/Rprop/And64InlineHook) (Relocalización de saltos absolutos).
 - [ARMPatch](https://github.com/Skifary/ARMPatch) (Macros de conveniencia e ideas de Pattern Scanner).
-- [GlossHook](https://github.com/AoThenBiceps/GlossHook) (Inspiración para límite de tamaño de símbolo en el relocator y namespace `Inst`).
 - [Obfuscate](https://github.com/adamyaxley/Obfuscate) (Cifrado de strings en tiempo de compilación).
 
 ## Licencia

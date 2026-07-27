@@ -69,26 +69,22 @@ public:
         }
 
         // ====================================================================
-        // BLOQUE INLINE HOOK (Mejorado con sym_size de GlossHook)
+        // BLOQUE INLINE HOOK (Mejorado con sym_size de GlossHook y Dobby LDR)
         // ====================================================================
-        
-        // 1. Obtener tamaño real del símbolo usando xDL
-        std::size_t max_reloc_size = kMaxPrologueSize; // Por defecto 200 bytes
+        std::size_t max_reloc_size = kMaxPrologueSize; 
         xdl_info_t info;
         void* cache = nullptr;
         if (xdl_addr4(target, &info, &cache, XDL_DEFAULT)) {
             if (info.dli_ssize > 0 && info.dli_ssize <= kMaxPrologueSize) {
-                max_reloc_size = info.dli_ssize; // Limitar al tamaño real de la función!
+                max_reloc_size = info.dli_ssize; 
             }
         }
         xdl_addr_clean(&cache);
 
-        // 2. Crear trampolín
         ExecMemGuard tramp_guard(kTrampolineSize); 
         void* tramp = tramp_guard.get();
         if (!tramp) return HOOK_ALLOC_FAILED;
         
-        // 3. Relocalizar pasando el max_reloc_size
         auto rel = Relocator::relocate(target, tramp, kMinPatchSize, max_reloc_size);
         
         if (rel.error == HOOK_OK) {
@@ -97,7 +93,7 @@ public:
             std::memcpy(h.backup.data(), target, h.patch_size);
             
             std::vector<std::uint8_t> full_patch(h.patch_size);
-            arm64::Inst::emit_movz_movk_br(full_patch.data(), reinterpret_cast<Address>(replacement));
+            arm64::Inst::emit_ldr_br(full_patch.data(), reinterpret_cast<Address>(replacement));
             arm64::Inst::fill_nops(full_patch.data(), kMinPatchSize, h.patch_size);
             
             if (Mem::make_rw(target, h.patch_size)) {
@@ -107,13 +103,11 @@ public:
                     maybe_disable_cfi(); h.active = true; hooks_.try_emplace(target, std::move(h));
                     if (original_out) *original_out = tramp; tramp_guard.release(); return HOOK_OK;
                 }
-                // Si fallar RX, revertir
                 atomic_write_inst(target, h.backup.data(), h.patch_size); 
                 Mem::flush_caches(target, h.patch_size); 
-                Mem::page_protect(target, h.patch_size, PROT_READ | PROT_EXEC);
+                Mem::make_rx(target, h.patch_size);
             }
             
-            // Si el Inline falla, intentar GOT
             std::vector<GOTHookEntry> got_entries;
             if (got_hook_all_modules(target, replacement, got_entries)) {
                 maybe_disable_cfi(); 
@@ -121,8 +115,6 @@ public:
                 hooks_.try_emplace(target, std::move(h_got)); 
                 if (original_out) *original_out = target; return HOOK_OK;
             }
-            
-            // Si GOT falla, intentar RET
             if (install_ret_patch(target, 0, false)) {
                 Hook h_ret; h_ret.target = target; h_ret.replacement = replacement; h_ret.is_ret_patch = true; h_ret.active = true;
                 hooks_.try_emplace(target, std::move(h_ret)); 
@@ -143,7 +135,7 @@ public:
             } else if (h.is_ret_patch) { remove_ret_patch(h.target); }
             else if (!h.backup.empty()) {
                 if (Mem::make_rw(h.target, h.backup.size())) {
-                    atomic_write_inst(h.target, h.backup.data(), h.backup.size()); Mem::flush_caches(h.target, h.backup.size()); Mem::page_protect(h.target, h.backup.size(), h.rx_prot);
+                    atomic_write_inst(h.target, h.backup.data(), h.backup.size()); Mem::flush_caches(h.target, h.backup.size()); Mem::make_rx(h.target, h.backup.size());
                 } else result = HOOK_MPROTECT_FAILED;
             }
             h.active = false;
@@ -153,7 +145,6 @@ public:
     }
 };
 
-// --- Pending Hooks ---
 struct PendingHook { std::string lib_name; std::string sym_name; void* replacement; void** original_out; };
 static std::vector<PendingHook> g_pending_hooks; static std::mutex g_pending_mu;
 
@@ -164,26 +155,23 @@ static void apply_pending_hooks_for_lib(const char* loaded_lib_name) {
           if (it->lib_name.find(loaded_lib_name) != std::string::npos) { to_process.push_back(*it); it = g_pending_hooks.erase(it); } else ++it;
       }}
     for (auto& p : to_process) {
-        // FIX: Usar la cache de xDL para no abrir la librería mil veces
         void* handle = get_cached_xdl_handle(loaded_lib_name); 
         if (!handle) continue;
         void* target = xdl_sym(handle, p.sym_name.c_str(), nullptr); 
         if (!target) target = xdl_dsym(handle, p.sym_name.c_str(), nullptr);
-        // Nota: No cerramos el handle porque está en cache
         if (target) { void* trampoline = nullptr; HookManager::instance().install(target, p.replacement, &trampoline); if (p.original_out) *p.original_out = trampoline; }
     }
 }
 
 } // namespace sandhook
 
-// --- C API ---
 extern "C" {
 
 int sandhook_install_ex(void* target, void* replacement, void** original_out) { return sandhook::HookManager::instance().install(target, replacement, original_out); }
 int sandhook_remove(void* target) { return sandhook::HookManager::instance().remove(target); }
 int sandhook_ret_patch(void* target, int64_t return_value, int use_return_value) { return sandhook::install_ret_patch(target, return_value, use_return_value != 0) ? HOOK_OK : HOOK_PROTECTED; }
 
-const char* sandhook_version() { return "sandhook-arm64-production-5.9"; }
+const char* sandhook_version() { return "sandhook-arm64-production-6.0"; }
 const char* sandhook_error_string(int err) {
     switch (err) {
         case HOOK_OK: return "OK"; case HOOK_NULL_ARGS: return "NULL_ARGS"; case HOOK_ALREADY_HOOKED: return "ALREADY_HOOKED";

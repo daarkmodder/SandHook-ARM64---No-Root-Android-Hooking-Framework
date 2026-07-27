@@ -25,14 +25,11 @@ static inline Kind decode_kind(std::uint32_t insn) {
     return Kind::Unknown;
 }
 
-// Renombrado Asm -> Inst
-void Inst::emit_movz_movk_br(std::uint8_t* out, Address target) {
+void Inst::emit_ldr_br(std::uint8_t* out, Address target) {
     auto emit32 = [&](std::uint32_t w) { std::memcpy(out, &w, 4); out += 4; };
-    emit32(0xD2800000 | (16 & 31) | ((target & 0xFFFFULL) << 5));
-    emit32(0xF2800000 | (16 & 31) | (((target >> 16) & 0xFFFFULL) << 5) | (1u << 21));
-    emit32(0xF2800000 | (16 & 31) | (((target >> 32) & 0xFFFFULL) << 5) | (2u << 21));
-    emit32(0xF2800000 | (16 & 31) | (((target >> 48) & 0xFFFFULL) << 5) | (3u << 21));
-    emit32(0xD61F0000 | ((16 & 31) << 5));
+    emit32(0x58000050); // LDR X16, [PC, #8]
+    emit32(0xD61F0200); // BR X16
+    std::memcpy(out, &target, 8); // Dirección absoluta
 }
 
 void Inst::fill_nops(std::uint8_t* out, std::size_t start, std::size_t end) {
@@ -41,7 +38,6 @@ void Inst::fill_nops(std::uint8_t* out, std::size_t start, std::size_t end) {
 
 } // namespace arm64
 
-// FIX: Acepta max_size para no sobrepasar el tamaño del símbolo
 Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_patch, std::size_t max_size) {
     Result r{}; auto* s = reinterpret_cast<std::uint8_t*>(src); auto* t = reinterpret_cast<std::uint8_t*>(tramp);
     Address src_addr = reinterpret_cast<Address>(src); Address tramp_addr = reinterpret_cast<Address>(tramp);
@@ -73,7 +69,6 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
         SigGuard guard(src_addr, src_addr + max_size);
         if (guard.jumped()) { r.error = HOOK_INVALID_TARGET; return r; }
         while (copied < min_patch) {
-            // FIX: Usar max_size en lugar de kMaxPrologueSize
             if (copied + 4 > max_size) { r.error = HOOK_BOUNDS_EXCEEDED; return r; }
             std::uint32_t insn; std::memcpy(&insn, s + copied, 4);
             auto kind = arm64::decode_kind(insn);
@@ -90,7 +85,9 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
             if (kind == arm64::Kind::ADRP) {
                 std::int64_t immlo = (insn >> 29) & 0x3; std::int64_t immhi = (insn >> 5) & 0x7FFFF; std::int64_t imm21 = (immhi << 2) | immlo;
                 if (imm21 & (1LL << 20)) imm21 |= -(1LL << 21); Address orig_target = (insn_addr & ~0xFFFULL) + (imm21 << 12);
-                Address new_adrp_base = (tramp_addr + tramp_offset) & ~0xFFFULL; std::int32_t new_imm21 = static_cast<std::int32_t>((int64_t(orig_target) - int64_t(new_adrp_base)) >> 12);
+                Address new_adrp_base = (tramp_addr + tramp_offset) & ~0xFFFULL; 
+                // FIX: AQUÍ ESTABA EL TYPO (new_addp_base -> new_adrp_base)
+                std::int32_t new_imm21 = static_cast<std::int32_t>((int64_t(orig_target) - int64_t(new_adrp_base)) >> 12);
                 reloced = (insn & 0x9F00001F) | (((new_imm21 >> 2) & 0x7FFFF) << 5) | ((new_imm21 & 0x3) << 29);
                 std::memcpy(t + tramp_offset, &reloced, 4); tramp_offset += 4;
             } else if (kind == arm64::Kind::ADR) {
@@ -121,8 +118,8 @@ Relocator::Result Relocator::relocate(void* src, void* tramp, std::size_t min_pa
             copied += 4;
         }
     }
-    arm64::Inst::emit_movz_movk_br(t + tramp_offset, src_addr + copied);
-    r.copied = copied; r.tramp_size = tramp_offset + 20; r.error = HOOK_OK; return r;
+    arm64::Inst::emit_ldr_br(t + tramp_offset, src_addr + copied);
+    r.copied = copied; r.tramp_size = tramp_offset + 16; r.error = HOOK_OK; return r;
 }
 
 } // namespace sandhook
