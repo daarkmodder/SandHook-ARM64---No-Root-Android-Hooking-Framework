@@ -1,5 +1,4 @@
 // art_hook.cpp
-// Dynamic ArtMethod Offset Finder + Entry Point Replacement (Android 9-14+)
 #include "art_method.h"
 #include <android/log.h>
 #include <cstring>
@@ -22,6 +21,10 @@ namespace sandhook {
         static int sdk_int = 0;
         static size_t entry_point_offset = 0;
         
+        // Hidden API: Punteros a funciones de suspensión de ART
+        static void (*art_suspend_vm)() = nullptr;
+        static void (*art_resume_vm)() = nullptr;
+        
         void init(JNIEnv* env) {
             if (sdk_int != 0) return;
 
@@ -31,13 +34,23 @@ namespace sandhook {
             sdk_int = env->GetStaticIntField(versionClass, sdkIntField);
             env->DeleteLocalRef(versionClass);
 
-            // 1. Cargar libart.so usando xDL
             void* libart = xdl_open("libart.so", XDL_DEFAULT);
             if (!libart) {
                 LOGE("Failed to load libart.so via xdl");
                 return;
             }
 
+            // 1. Resolver Suspensión de VM (StopTheWorld real)
+            // FIX: xdl_dsym requiere 3 argumentos (handle, symbol, symbol_size)
+            art_suspend_vm = (void(*)())xdl_dsym(libart, "_ZN3art3Dbg9SuspendVMEv", nullptr);
+            art_resume_vm = (void(*)())xdl_dsym(libart, "_ZN3art3Dbg8ResumeVMEv", nullptr);
+            if (art_suspend_vm && art_resume_vm) {
+                LOGI("ART SuspendVM/ResumeVM resolved successfully!");
+            } else {
+                LOGW("Could not resolve SuspendVM. Thread safety fallback to mutex.");
+            }
+
+            // 2. Resolver Entry Point
             void* interpreter_bridge = xdl_sym(libart, "art_quick_to_interpreter_bridge", nullptr);
             if (!interpreter_bridge) {
                 LOGW("Symbol not in .dynsym. Trying hidden .symtab via xdl_dsym...");
@@ -47,13 +60,12 @@ namespace sandhook {
             if (!interpreter_bridge) {
                 LOGW("Could not find art_quick_to_interpreter_bridge. Using fallback offset 24.");
                 entry_point_offset = 24; 
-                xdl_close(libart); // FIX DE FUGA
+                xdl_close(libart);
                 return;
             }
 
             LOGI("Successfully found art_quick_to_interpreter_bridge via xDL!");
 
-            // 2. Obtener un ArtMethod conocido (Object.hashCode)
             jclass objClass = env->FindClass("java/lang/Object");
             jmethodID dummy_method = env->GetMethodID(objClass, "hashCode", "()I");
             env->DeleteLocalRef(objClass);
@@ -61,11 +73,10 @@ namespace sandhook {
             if (!dummy_method) {
                 LOGE("Failed to get dummy method for offset calculation.");
                 entry_point_offset = 24;
-                xdl_close(libart); // FIX DE FUGA
+                xdl_close(libart);
                 return;
             }
 
-            // 3. Calcular offset dinámicamente
             uintptr_t art_method_ptr = reinterpret_cast<uintptr_t>(dummy_method);
             entry_point_offset = 0;
             
@@ -84,7 +95,27 @@ namespace sandhook {
                 LOGI("Dynamic ArtMethod offset found successfully: %zu", entry_point_offset);
             }
             
-            xdl_close(libart); // FIX DE FUGA AL FINAL
+            xdl_close(libart);
+        }
+
+        void suspend_vm() {
+            if (art_suspend_vm) art_suspend_vm();
+        }
+
+        void resume_vm() {
+            if (art_resume_vm) art_resume_vm();
+        }
+
+        void disable_compilable(jmethodID methodId) {
+            if (!methodId || sdk_int < 24) return; // Solo Android 7+
+            uintptr_t art_method_ptr = reinterpret_cast<uintptr_t>(methodId);
+            
+            // En Android 9-14, access_flags está en el offset 4
+            uint32_t* access_flags = reinterpret_cast<uint32_t*>(art_method_ptr + 4);
+            
+            // kAccCompileDontBother (0x02000000) en Android 8.1+
+            // kAccPreCompiled (0x00200000) en Android 7-8
+            *access_flags |= 0x02000000 | 0x00200000;
         }
 
         void* pac_strip(void* addr) {

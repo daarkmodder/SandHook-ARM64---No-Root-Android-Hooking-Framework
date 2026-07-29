@@ -2,50 +2,54 @@
 
 Un framework de hooking de **nivel empresarial/militar** para Android ARM64. Funciona sin root y es compatible con Android 5.0 hasta Android 14+. Soporta tanto **Hooking Nativo (C/C++)** como **Hooking de Java (ART/Dalvik)**.
 
-Este proyecto es el resultado de una fusión manual y depuración exhaustiva de las técnicas más avanzadas de los motores de hooking más respetados de la industria (Dobby, ShadowHook, ByteHook, GlossHook, xHook, And64InlineHook, LSPosed, ARMPatch), combinadas en un núcleo C++ puro, limpio y ultrarrápido.
+Este proyecto es el resultado de una fusión manual y depuración exhaustiva de las técnicas más avanzadas de los motores de hooking más respetados de la industria (Dobby, ShadowHook, ByteHook, GlossHook, xHook, And64InlineHook, LSPosed, ARMPatch, SandHook Original), combinadas en un núcleo C++ puro, limpio y ultrarrápido.
 
 > ⚠️ **Aviso de Compatibilidad:** 
 > Este framework está escrito y optimizado estrictamente para **C++ y Ensamblador (ARM64)**. Recompilación con `clang++` y la librería estándar de C++.
 
-**Versión:** 6.0 (Military Grade: Hybrid Engine - Dobby + ShadowHook + GlossHook)  
+**Versión:** 7.0 (Military Grade: Full ART Bridge + StopTheWorld + Anti-JIT)  
 **Arquitectura:** Android ARM64 (aarch64) únicamente  
 **Requisitos:** Android 5.0+ (API 21+), No se requiere Root.
 
 ---
 
-## 🔥 Características Principales (v6.0)
+## 🔥 Características Principales (v7.0)
 
-La versión 6.0 implementa técnicas de evasión de seguridad de nivel Dios, permitiendo hookear aplicaciones en Android 13/14 con SELinux Enforcing y CFI activos sin causar crasheos:
+La versión 7.0 implementa técnicas de evasión de seguridad de nivel Dios, permitiendo hookear aplicaciones en Android 13/14 con SELinux Enforcing y CFI activos sin causar crasheos:
 
+### Motor Nativo (Producción-Ready)
 1. **Ofuscación de Strings en Tiempo de Compilación:**
-   Integración de `obfuscate.h` (AY_OBFUSCATE). Todas las cadenas de texto sensibles (`/proc/self/mem`, `libart.so`, `__cfi_slowpath`) se cifran con XOR en tiempo de compilación. Los decompiladores (Ghidra/IDA Pro) solo verán basura ilegible.
-2. **Bypass de Anti-Tampering (PairIP/SELinux) vía Syscalls Directas:**
-   Las protecciones modernas hookean `libc` (`mprotect`, `open`). Este motor elimina las llamadas a `libc` y ejecuta **Syscalls Directas al Kernel** (`SYS_openat`, `SYS_write`) para escribir en `/proc/self/mem` y `process_vm_writev`, evadiendo PairIP por completo.
+   Integración de `obfuscate.h` (AY_OBFUSCATE). Todas las cadenas de texto sensibles se cifran con XOR en tiempo de compilación.
+2. **Bypass de Anti-Tampering vía Syscalls Directas:**
+   Ejecuta **Syscalls Directas al Kernel** (`SYS_openat`, `SYS_write`) para escribir en `/proc/self/mem`, evadiendo PairIP por completo.
 3. **Bypass de Linker Namespace Isolation (Android 8+):**
-   Las apps normales tienen prohibido hacer `dlopen("libart.so")`. El motor usa xDL para parsear los encabezados ELF directamente en memoria, evadiendo el bloqueo del Linker de Android.
+   Uso de xDL para parsear encabezados ELF en memoria, evadiendo el bloqueo del Linker de Android.
 4. **Bypass de Símbolos Ocultos (Android 10+ .symtab):**
-   Google ocultó miles de símbolos internos de la tabla dinámica (`.dynsym`). Si xDL no encuentra `art_quick_to_interpreter_bridge` en memoria, automáticamente lee el archivo del disco y busca en la tabla estática (`.symtab`) usando `xdl_dsym`.
-5. **PAC Safe Fallback (Android 13/14):**
-   En ARM64 v8.3+, los punteros de `ArtMethod` están firmados criptográficamente (PAC). Si el motor detecta que la firma PAC impide calcular el offset dinámico del `entry_point`, cae automáticamente a un offset seguro (`24`) garantizando que los hooks de Java funcionen sin crashear la VM.
-6. **Direct ART Swap (Hooking de Java sin ASM Bridge):**
-   En lugar de usar un puente C++ gigante (como LSPosed), el motor utiliza "Direct Swap". Obtiene el `entry_point` nativo (JIT) de tu método de reemplazo y lo inyecta directamente en el `ArtMethod` original. Se incluye un `warmUpMethod` en Java para forzar la compilación JIT antes de hookear.
-7. **Motor Protection-Aware (Triple Fallback):**
-   Si el motor detecta que CFI está activo y no puede ser desactivado, **prohíbe el Inline Hooking** para evitar `SIGSEGV`. En su lugar, activa un sistema de respaldo de 3 niveles:
-   - Nivel 1: Intenta **GOT Hooking Mejorado** (escaneo `.rela.plt` y `.rela.dyn`).
-   - Nivel 2: Si GOT falla, aplica **RET Patch (Neutralización)**.
-   - Nivel 3: Si nada funciona, falla limpiamente devolviendo `HOOK_PROTECTED`.
-8. **Dobby Page Shadowing (Bypass de SELinux execmod):**
-   Cuando SELinux prohíbe usar `mprotect` para devolverle el permiso de ejecución a una página de memoria, el motor usa la técnica de Dobby: crea una página anónima nueva con `mmap` y `MAP_FIXED` exactamente en la misma dirección física. Como es anónima, SELinux permite darle permisos de ejecución, salvando la app de crashear.
-9. **ShadowHook Atomic Patching:**
-   Para evitar race conditions y crasheos intermitentes en entornos multihilo, la escritura de los parches en memoria se realiza utilizando instrucciones atómicas de hardware (`__atomic_store_n`) inspiradas en ShadowHook, garantizando que ningún hilo lea el código a medias.
-10. **Salto Absoluto Limpio de 16 bytes (LDR + BR):**
-    Inspirado en Dobby, el motor inyecta un salto absoluto de 16 bytes (`LDR X16, #8` + `BR X16` + `Addr`). Esto redujo el tamaño mínimo del parche de 20 a 16 bytes, permitiendo hookear funciones mucho más cortas sin fallar por límites de tamaño.
-11. **Pattern Scanner y Utilidades de Bajo Nivel (ARMPatch Style):**
-    Se ha añadido `sandhook_find_pattern` para escanear patrones de bytes con comodines (`??`), un cache de handles xDL para evitar fugas de memoria, y macros de conveniencia (`DECL_HOOK`, `HOOK_ADDR`, `HOOK_SYM`).
-12. **Hooks Diferidos (Pending Hooks) Anti-Bloqueo:**
-    Usando `sandhook_install_pending`, el motor intercepta `dlopen` y `android_dlopen_ext`; cada vez que una nueva librería se carga, los hooks pendientes se aplican automáticamente usando el motor xDL.
-13. **ShadowHook-Style Atomic Patching & SIGSEGV Protection:**
-    Usa un manejador de señales global (`sigsetjmp`/`siglongjmp`) que salva la app de crasheos si se lee una dirección inválida, estrictamente aislado a los rangos de memoria objetivo.
+   Búsqueda automática en la tabla estática (`.symtab`) usando `xdl_dsym`.
+5. **Motor Protection-Aware (Triple Fallback):**
+   Si CFI está activo y no puede ser desactivado, prohíbe el Inline Hooking y activa un sistema de respaldo de 3 niveles: GOT Hooking Mejorado -> RET Patch (Neutralización) -> Fallo limpio (`HOOK_PROTECTED`).
+6. **Dobby Page Shadowing:**
+   Uso de `mmap` con `MAP_FIXED` para bypasear el `execmod` de SELinux, creando páginas anónimas ejecutables.
+7. **ShadowHook Atomic Patching:**
+   Escritura de parches en memoria utilizando instrucciones atómicas de hardware (`__atomic_store_n`) evitando race conditions multihilo.
+8. **Salto Absoluto Limpio de 16 bytes (LDR + BR):**
+   Reducción del tamaño mínimo del parche a 16 bytes, permitiendo hookear funciones mucho más cortas.
+
+### Motor ART / Java (El "Jefe Final" Vencido)
+9. **Puente JNI Dinámico (ART Dispatcher):**
+   Implementación de un trampolín completo en ensamblador (`art_quick_stub.S`) que salva el contexto completo de la CPU (x0-x30, q0-q7). Un dispatcher en C++ lee el "shorty" del método, empaqueta los registros de la ABI de ARM64 en un array de `jvalue` y llama a `JNIEnv->Call*MethodA` para ejecutar el método de reemplazo en Java.
+10. **ART StopTheWorld (SuspendVM Real):**
+    Integración de las Hidden APIs de Android (`art::Dbg::SuspendVM` / `art::Dbg::ResumeVM` vía xDL). Antes de modificar un `ArtMethod`, el motor pausa todos los hilos de la máquina virtual de Java, evitando crasheos instantáneos por race conditions.
+11. **Anti-JIT Recompilation:**
+    Uso de los flags internos `kAccCompileDontBother` y `kAccPreCompiled` en el `ArtMethod` para prohibirle al compilador JIT de Android que recompile el método hookeado, evitando que el hook se borre en tiempo de ejecución.
+12. **PAC Safe Fallback:**
+    Limpieza de firmas PAC (ARM64 v8.3+) y fallback a offset seguro (`24`) para Android 13/14.
+
+### Utilidades
+13. **Pattern Scanner y Utilidades de Bajo Nivel (ARMPatch Style):**
+    `sandhook_find_pattern` para escanear patrones de bytes con comodines (`??`), cache de handles xDL, y macros de conveniencia (`DECL_HOOK`, `HOOK_ADDR`, `HOOK_SYM`).
+14. **Hooks Diferidos (Pending Hooks) Anti-Bloqueo:**
+    Intercepta `dlopen` y `android_dlopen_ext`; cada vez que una nueva librería se carga, los hooks pendientes se aplican automáticamente.
 
 ---
 
@@ -53,13 +57,13 @@ La versión 6.0 implementa técnicas de evasión de seguridad de nivel Dios, per
 
 El núcleo ha sido dividido en módulos independientes para garantizar bajo acoplamiento y fácil mantenimiento:
 
-- **`src/core/`**: El orquestador (`hook_manager.cpp`). Decide si usar Inline, GOT o RET Patch. Incluye utilidades y cache de xDL.
-- **`src/arm64/`**: Decodificador y relocalizador de instrucciones ARM64 (Namespace `Inst`).
-- **`src/memory/`**: Syscalls directas, manejo de `mprotect`, bypass `MAP_FIXED` y el aislador de señales `SigGuard`.
+- **`src/core/`**: El orquestador (`hook_manager.cpp`). Decide si usar Inline, GOT o RET Patch.
+- **`src/arm64/`**: Decodificador y relocalizador de instrucciones ARM64.
+- **`src/memory/`**: Syscalls directas, manejo de `mprotect`, bypass `MAP_FIXED` y aislador de señales `SigGuard`.
 - **`src/got/`**: Escaneo de tablas ELF para Hooking por GOT/PLT.
 - **`src/protections/`**: Bypass de CFI y parcheo de neutralización (RET Patch).
-- **`src/art/`**: Puentes y trampolines para la máquina virtual de Java (ART).
-- **`src/jni/`**: Conexión directa entre la API de Java y el motor nativo.
+- **`src/art/`**: Puentes, trampolines y manipulación interna de ART (SuspendVM, Anti-JIT, Offset Dinámico).
+- **`src/jni/`**: Conexión directa entre la API de Java y el motor nativo (Dispatcher ABI).
 - **`src/public/`** y **`src/internal/`**: Cabeceras de API pública y declaraciones cruzadas internas.
 
 ---
@@ -104,7 +108,7 @@ cd out/dex && zip -r ../sandhook-java.jar classes.dex && cd ../..
    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
    invoke-static {}, Lcom/swift/sandhook/SandHook;->init()V
    ```
-4. **Firma y prueba:** Guarda, firma el APK e instálalo. Si miras el Logcat verás el motor inicializándose.
+4. **Firma y prueba:** Guarda, firma el APK e instálalo.
 
 ---
 
@@ -119,7 +123,6 @@ HOOK_SYM(kill_hook, "libc.so", "kill");
 
 // 2. Ejemplo de bypass extremo: Neutralizar JNI_OnLoad
 void bypass_jni_onload(void* jni_onload_addr) {
-    // Hace que la función retorne 0x00010006 (JNI_VERSION_1_6) sin ejecutar su código
     sandhook_ret_patch(jni_onload_addr, 0x00010006, 1);
 }
 
@@ -172,6 +175,7 @@ El desarrollo de herramientas de hooking a bajo nivel requiere pruebas exhaustiv
 - [xDL](https://github.com/hexhacking/xDL) (Resolución de símbolos ELF robusta).
 - [And64InlineHook](https://github.com/Rprop/And64InlineHook) (Relocalización de saltos absolutos).
 - [ARMPatch](https://github.com/Skifary/ARMPatch) (Macros de conveniencia e ideas de Pattern Scanner).
+- [SandHook Original](https://github.com/asLody/SandHook) (ART SuspendVM, Anti-JIT Flags, ABI Packing).
 - [Obfuscate](https://github.com/adamyaxley/Obfuscate) (Cifrado de strings en tiempo de compilación).
 
 ## Licencia

@@ -11,13 +11,13 @@ TARGET="aarch64-linux-android21"
 COMMON_FLAGS="-fPIC -O2 -fno-exceptions -fno-rtti"
 INCLUDES="-Isrc/internal -Isrc/public -Isrc/xdl -Isrc -Isrc/art"
 
-echo -e "${CYAN}🛠 SandHook v5.8 Modular Build Script${NC}"
+echo -e "${CYAN}🛠 SandHook v7.0 Modular Build Script${NC}"
 echo "1. Compilar Todo (libsandhook.a + libsandhook.so)"
 echo "2. Limpiar archivos temporales (.o)"
 read -p "Selecciona una opción (1/2): " option
 
 if [ "$option" == "1" ]; then
-    echo -e "${CYAN}🚀 Compilando SandHook v5.8...${NC}"
+    echo -e "${CYAN}🚀 Compilando SandHook v7.0...${NC}"
 
     echo "Compilando xDL..."
     clang -c -fPIC -O2 --target=$TARGET -Isrc/xdl src/xdl/xdl.c -o xdl.o

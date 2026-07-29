@@ -38,7 +38,7 @@ sandhook_art_quick_stub:
     str x0, [sp, #(1 * 8)] // Guardar x0
 
     // Calcular el SP original (SP antes de que empezáramos a restar)
-    add x17, sp, #(2 * 8)               // x17 = sp + 16
+    add x17, sp, #(2 * 8)
     add x17, x17, #(30 * 8 + 8 * 16)    // x17 = sp + 16 + 240 + 128 (SP original)
     str x17, [sp, #(0 * 8)]             // Guardar SP original en la pila
 
@@ -49,7 +49,7 @@ sandhook_art_quick_stub:
     ldr x1, [sp, #(1 * 8)]
     bl sandhook_art_quick_handler
 
-    // 5. Restaurar x0
+    // 5. Restaurar x0 (aquí el handler ya escribió el valor de retorno en ctx->x0)
     ldr x0, [sp, #(1 * 8)]
     add sp, sp, #(2 * 8)
 
@@ -78,6 +78,8 @@ sandhook_art_quick_stub:
     ldp q6, q7, [sp, #(6 * 16)]
     add sp, sp, #(8 * 16)
 
-    // 8. Saltar a la función original
-    // La dirección original fue guardada por el handler de C++ en x8
-    br x8
+    // 8. Retornar al llamador
+    // FIX: Usar 'ret' en lugar de 'br x8'. 
+    // Como x30 (LR) ya fue restaurado, esto devuelve el control a la app
+    // llevándose el valor de retorno que el handler dejó en x0.
+    ret
