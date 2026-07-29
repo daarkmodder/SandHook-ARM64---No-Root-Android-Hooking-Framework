@@ -1,5 +1,9 @@
 # SandHook ARM64 - Military Grade Android Hooking Framework
 
+
+![](https://img.shields.io/badge/license-MIT-brightgreen.svg?style=flat)
+![](https://img.shields.io/badge/Android-4.1%20--%2017-blue.svg?style=flat)
+
 Un framework de hooking de **nivel empresarial/militar** para Android ARM64. Funciona sin root y es compatible con Android 5.0 hasta Android 14+. Soporta tanto **Hooking Nativo (C/C++)** como **Hooking de Java (ART/Dalvik)**.
 
 Este proyecto es el resultado de una fusión manual y depuración exhaustiva de las técnicas más avanzadas de los motores de hooking más respetados de la industria (Dobby, ShadowHook, ByteHook, GlossHook, xHook, And64InlineHook, LSPosed, ARMPatch, SandHook Original), combinadas en un núcleo C++ puro, limpio y ultrarrápido.
